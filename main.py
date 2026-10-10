@@ -134,13 +134,43 @@ async def connect_user(session):
             await candidate.disconnect()
             return False, "Session is not authorized. Generate a valid Telethon StringSession."
 
-        me = await candidate.get_me()
-        if not me:
-            await candidate.disconnect()
-            return False, "Could not identify the account."
+        
+me = await candidate.get_me()
+if not me:
+    await candidate.disconnect()
+    return False, "Could not identify the account."
 
-        old = user_client
-        user_client = candidate
+# Register commands on the logged-in user account.
+@candidate.on(events.NewMessage(outgoing=True))
+async def outgoing_commands(event):
+    try:
+        await handle_user_commands(candidate, event)
+    except Exception:
+        # Avoid logging private messages or session credentials.
+        pass
+
+# Auto-reply to private messages while AFK.
+@candidate.on(events.NewMessage(incoming=True))
+async def incoming_afk(event):
+    if not afk_reason or event.out or not event.is_private:
+        return
+
+    if event.sender_id == OWNER_ID:
+        return
+
+    try:
+        await event.reply(f"I'm AFK: {afk_reason}")
+    except Exception:
+        pass
+
+old = user_client
+user_client = candidate
+
+if old and old.is_connected():
+    await old.disconnect()
+
+return True, f"Connected as {me.first_name}."
+
 
         if old and old.is_connected():
             await old.disconnect()
