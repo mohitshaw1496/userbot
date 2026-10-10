@@ -1,17 +1,15 @@
 
-import ast
-import asyncio
-import io
-import operator
 import os
-import re
+import ast
+import operator
+import asyncio
 import sqlite3
 import threading
 from datetime import datetime
 
-from flask import Flask
-from PIL import Image, ImageDraw, ImageFont
-from deep_translator import GoogleTranslator
+from flask import Flask, jsonify
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -20,50 +18,137 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
+from deep_translator import GoogleTranslator
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-PORT = int(os.environ.get("PORT", "10000"))
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_ID = int(os.getenv("TG_API_ID", "0"))
+API_HASH = os.getenv("TG_API_HASH", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing from Render environment variables.")
+if not API_ID or not API_HASH:
+    raise RuntimeError("TG_API_ID or TG_API_HASH is missing.")
+if not OWNER_ID:
+    raise RuntimeError("OWNER_ID is missing.")
+
+app = Flask(__name__)
 
 user_client = None
 login_waiting = set()
+
 afk_reason = None
 autocal = False
-reminders = {}
 reminder_counter = 0
 reminder_tasks = {}
 
-db = sqlite3.connect("todos.db", check_same_thread=False)
-db.execute("""
-CREATE TABLE IF NOT EXISTS todos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task TEXT NOT NULL,
-    done INTEGER NOT NULL DEFAULT 0
-)
-""")
-db.commit()
 
-web = Flask(__name__)
+# =========================================================
+# DATABASE
+# =========================================================
+
+DB_PATH = "todos.db"
 
 
-@web.get("/")
-@web.get("/health")
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                task TEXT NOT NULL,
+                done INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+
+def add_todo(task):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO todos (owner_id, task, done, created_at) "
+            "VALUES (?, ?, 0, ?)",
+            (OWNER_ID, task, datetime.now().isoformat(timespec="seconds")),
+        )
+        return cur.lastrowid
+
+
+def get_todos(include_done=False):
+    with sqlite3.connect(DB_PATH) as conn:
+        if include_done:
+            rows = conn.execute(
+                "SELECT id, task, done FROM todos "
+                "WHERE owner_id = ? ORDER BY id",
+                (OWNER_ID,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, task, done FROM todos "
+                "WHERE owner_id = ? AND done = 0 ORDER BY id",
+                (OWNER_ID,),
+            ).fetchall()
+    return rows
+
+
+def finish_todo(todo_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE todos SET done = 1 WHERE id = ? AND owner_id = ?",
+            (todo_id, OWNER_ID),
+        )
+        return cur.rowcount > 0
+
+
+init_db()
+
+
+# =========================================================
+# FLASK / RENDER HEALTH CHECK
+# =========================================================
+
+@app.route("/")
+def home():
+    return "Telegram manager is running."
+
+
+@app.route("/health")
 def health():
-    connected = bool(user_client and user_client.is_connected())
-    return {"ok": True, "userbot_connected": connected}, 200
+    return jsonify({
+        "status": "ok",
+        "userbot_connected": bool(
+            user_client and user_client.is_connected()
+        ),
+    })
 
 
 def run_web():
-    web.run(host="0.0.0.0", port=PORT, use_reloader=False)
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# =========================================================
+# SAFE CALCULATOR
+# =========================================================
+
+_ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
 
 
 def calculate(expression):
-    """Safely evaluate basic arithmetic without executing Python code."""
     tree = ast.parse(expression, mode="eval")
 
     def evaluate(node):
@@ -73,53 +158,372 @@ def calculate(expression):
         if isinstance(node, ast.Constant) and type(node.value) in (int, float):
             return node.value
 
-        if isinstance(node, ast.UnaryOp):
-            value = evaluate(node.operand)
-            if isinstance(node.op, ast.UAdd):
-                return value
-            if isinstance(node.op, ast.USub):
-                return -value
-
         if isinstance(node, ast.BinOp):
-            operations = {
-                ast.Add: operator.add,
-                ast.Sub: operator.sub,
-                ast.Mult: operator.mul,
-                ast.Div: operator.truediv,
-                ast.FloorDiv: operator.floordiv,
-                ast.Mod: operator.mod,
-                ast.Pow: operator.pow,
-            }
-            fn = operations.get(type(node.op))
-            if fn is None:
-                raise ValueError("Unsupported operator")
+            op_type = type(node.op)
+            if op_type not in _ALLOWED_OPERATORS:
+                raise ValueError("Operator not allowed.")
 
-            left, right = evaluate(node.left), evaluate(node.right)
-            if isinstance(node.op, ast.Pow) and abs(right) > 10:
-                raise ValueError("Exponent too large")
+            left = evaluate(node.left)
+            right = evaluate(node.right)
 
-            result = fn(left, right)
-            if not isinstance(result, (int, float)) or abs(result) > 1e100:
-                raise ValueError("Result out of range")
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("Exponent is too large.")
+
+            result = _ALLOWED_OPERATORS[op_type](left, right)
+
+            if isinstance(result, (int, float)) and abs(result) > 1e100:
+                raise ValueError("Result is too large.")
+
             return result
 
-        raise ValueError("Invalid expression")
+        if isinstance(node, ast.UnaryOp):
+            op_type = type(node.op)
+            if op_type not in _ALLOWED_OPERATORS:
+                raise ValueError("Operator not allowed.")
+            return _ALLOWED_OPERATORS[op_type](evaluate(node.operand))
+
+        raise ValueError("Invalid expression.")
 
     return evaluate(tree)
 
 
 def parse_duration(value):
-    match = re.fullmatch(r"(\d+)(s|m|h|d)?", value.lower())
-    if not match:
-        raise ValueError("Invalid duration")
-    amount = int(match.group(1))
-    unit = match.group(2) or "m"
-    seconds = amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-    if not 1 <= seconds <= 7 * 86400:
-        raise ValueError("Duration must be between 1 second and 7 days")
+    value = value.strip().lower()
+
+    units = {
+        "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+        "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+        "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+        "d": 86400, "day": 86400, "days": 86400,
+    }
+
+    number = ""
+    unit = ""
+
+    for char in value:
+        if char.isdigit() or char == ".":
+            if unit:
+                raise ValueError("Use a duration like 30m or 2h.")
+            number += char
+        else:
+            unit += char
+
+    if not number or not unit or unit not in units:
+        raise ValueError("Use a duration like 30s, 10m, 2h, or 1d.")
+
+    seconds = float(number) * units[unit]
+
+    if seconds <= 0 or seconds > 7 * 86400:
+        raise ValueError("Duration must be between 1 second and 7 days.")
+
     return seconds
 
 
+# =========================================================
+# USERBOT COMMANDS
+# Commands are sent from your own Telegram account.
+# =========================================================
+
+async def handle_user_commands(client, event):
+    global afk_reason, autocal, reminder_counter
+
+    text = (event.raw_text or "").strip()
+    if not text:
+        return
+
+    parts = text.split(maxsplit=1)
+    command = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    # Ignore regular messages unless auto-calculator is enabled.
+    if not command.startswith("."):
+        if autocal:
+            try:
+                result = calculate(text)
+                await event.reply(f"= {result}")
+            except Exception:
+                pass
+        return
+
+    if command == ".help":
+        await event.reply(
+            "**Userbot commands**\n\n"
+            "`.help` — show commands\n"
+            "`.ping` — check response\n"
+            "`.id` — show chat/user ID\n"
+            "`.cal 2+2` — calculate\n"
+            "`.autocal on/off` — auto calculator\n"
+            "`.todo task` — add a task\n"
+            "`.todos` — list unfinished tasks\n"
+            "`.done 1` — finish a task\n"
+            "`.remind 10m text` — set a reminder\n"
+            "`.reminders` — list active reminders\n"
+            "`.afk reason` — enable AFK replies\n"
+            "`.back` — disable AFK replies\n"
+            "`.purge 10` — delete your last N messages\n"
+            "`.cleanall` — delete your last 100 messages\n"
+            "`.pfp` — send your profile photo\n"
+            "Reply to a user with `.block` or `.unblock`\n"
+            "Reply to a message with `.copy`\n"
+            "`.quote text` — format a quote\n"
+            "`.translate es hello` — translate text\n"
+            "`.spam 3 text` — send up to 3 messages"
+        )
+        return
+
+    if command == ".ping":
+        await event.reply("Pong!")
+        return
+
+    if command == ".id":
+        chat = await event.get_chat()
+        reply = await event.get_reply_message()
+        user_id = reply.sender_id if reply else event.sender_id
+        await event.reply(
+            f"Chat ID: `{event.chat_id}`\nUser ID: `{user_id}`"
+        )
+        return
+
+    if command == ".cal":
+        if not argument:
+            await event.reply("Usage: `.cal 2+2`")
+            return
+        try:
+            await event.reply(f"= {calculate(argument)}")
+        except Exception:
+            await event.reply("Invalid calculation.")
+        return
+
+    if command == ".autocal":
+        value = argument.lower()
+        if value not in ("on", "off"):
+            await event.reply("Usage: `.autocal on` or `.autocal off`")
+            return
+        autocal = value == "on"
+        await event.reply(f"Auto-calculator: {'ON' if autocal else 'OFF'}")
+        return
+
+    if command == ".todo":
+        if not argument:
+            await event.reply("Usage: `.todo Buy groceries`")
+            return
+        todo_id = add_todo(argument)
+        await event.reply(f"Added task #{todo_id}: {argument}")
+        return
+
+    if command == ".todos":
+        todos = get_todos()
+        if not todos:
+            await event.reply("You have no unfinished tasks.")
+            return
+        lines = [f"#{row[0]} — {row[1]}" for row in todos]
+        await event.reply("**Your tasks**\n" + "\n".join(lines))
+        return
+
+    if command == ".done":
+        try:
+            todo_id = int(argument)
+        except ValueError:
+            await event.reply("Usage: `.done 1`")
+            return
+
+        if finish_todo(todo_id):
+            await event.reply(f"Task #{todo_id} completed.")
+        else:
+            await event.reply("Task not found or already completed.")
+        return
+
+    if command == ".remind":
+        reminder_parts = argument.split(maxsplit=1)
+        if len(reminder_parts) != 2:
+            await event.reply("Usage: `.remind 10m take a break`")
+            return
+
+        try:
+            seconds = parse_duration(reminder_parts[0])
+        except ValueError as exc:
+            await event.reply(str(exc))
+            return
+
+        reminder_counter += 1
+        reminder_id = reminder_counter
+        chat_id = event.chat_id
+        reminder_text = reminder_parts[1]
+
+        async def send_reminder():
+            try:
+                await asyncio.sleep(seconds)
+                await client.send_message(
+                    chat_id,
+                    f"⏰ Reminder #{reminder_id}: {reminder_text}",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print("Reminder error:", type(exc).__name__)
+            finally:
+                reminder_tasks.pop(reminder_id, None)
+
+        task = asyncio.create_task(send_reminder())
+        reminder_tasks[reminder_id] = {
+            "task": task,
+            "text": reminder_text,
+            "chat_id": chat_id,
+        }
+
+        await event.reply(f"Reminder #{reminder_id} set.")
+        return
+
+    if command == ".reminders":
+        if not reminder_tasks:
+            await event.reply("No active reminders.")
+            return
+
+        lines = [
+            f"#{rid}: {info['text']}"
+            for rid, info in reminder_tasks.items()
+        ]
+        await event.reply("**Active reminders**\n" + "\n".join(lines))
+        return
+
+    if command == ".afk":
+        afk_reason = argument or "Away"
+        await event.reply(f"AFK enabled: {afk_reason}")
+        return
+
+    if command == ".back":
+        afk_reason = None
+        await event.reply("Welcome back! AFK disabled.")
+        return
+
+    if command in (".purge", ".cleanall"):
+        if command == ".cleanall":
+            count = 100
+        else:
+            try:
+                count = int(argument)
+            except ValueError:
+                await event.reply("Usage: `.purge 10`")
+                return
+
+        if count < 1 or count > 100:
+            await event.reply("Choose a number between 1 and 100.")
+            return
+
+        deleted = 0
+        try:
+            async for message in client.iter_messages(
+                event.chat_id, limit=count + 1
+            ):
+                if message.out:
+                    await message.delete()
+                    deleted += 1
+        except Exception as exc:
+            print("Purge error:", type(exc).__name__)
+            return
+
+        # The command may have deleted itself, so don't reply afterward.
+        return
+
+    if command == ".pfp":
+        try:
+            photo = await client.download_profile_photo("me", file=bytes)
+            if not photo:
+                await event.reply("No profile photo found.")
+                return
+            await client.send_file(event.chat_id, photo, caption="My profile photo")
+        except Exception as exc:
+            print("Profile photo error:", type(exc).__name__)
+            await event.reply("Could not retrieve the profile photo.")
+        return
+
+    if command in (".block", ".unblock"):
+        reply = await event.get_reply_message()
+        if not reply:
+            await event.reply(f"Reply to a user's message with `{command}`.")
+            return
+
+        try:
+            target = await reply.get_sender()
+            if command == ".block":
+                await client.block_user(target)
+                await event.reply("User blocked.")
+            else:
+                await client.unblock_user(target)
+                await event.reply("User unblocked.")
+        except Exception as exc:
+            print("Block command error:", type(exc).__name__)
+            await event.reply("Could not complete that action.")
+        return
+
+    if command == ".copy":
+        reply = await event.get_reply_message()
+        if not reply:
+            await event.reply("Reply to a text message with `.copy`.")
+            return
+        if reply.raw_text:
+            await client.send_message(event.chat_id, reply.raw_text)
+        else:
+            await event.reply("The replied message has no text to copy.")
+        return
+
+    if command == ".quote":
+        if not argument:
+            await event.reply("Usage: `.quote text`")
+            return
+        await event.reply(f"❝ {argument} ❞")
+        return
+
+    if command == ".translate":
+        translation_parts = argument.split(maxsplit=1)
+        if len(translation_parts) != 2:
+            await event.reply("Usage: `.translate es Hello there`")
+            return
+
+        language, source_text = translation_parts
+        try:
+            translated = await asyncio.to_thread(
+                GoogleTranslator(
+                    source="auto",
+                    target=language
+                ).translate,
+                source_text,
+            )
+            await event.reply(translated)
+        except Exception as exc:
+            print("Translation error:", type(exc).__name__)
+            await event.reply(
+                "Translation failed. Check the language code, "
+                "for example `es`, `fr`, or `hi`."
+            )
+        return
+
+    if command == ".spam":
+        spam_parts = argument.split(maxsplit=1)
+        if len(spam_parts) != 2:
+            await event.reply("Usage: `.spam 3 Hello`")
+            return
+
+        try:
+            count = int(spam_parts[0])
+        except ValueError:
+            await event.reply("Enter a valid count.")
+            return
+
+        if count < 1 or count > 5:
+            await event.reply("Count must be between 1 and 5.")
+            return
+
+        # Use only in chats where repeated messages are welcome.
+        for _ in range(count):
+            await client.send_message(event.chat_id, spam_parts[1])
+            await asyncio.sleep(1)
+        return
+
+
+# =========================================================
+# CONNECT / DISCONNECT USER ACCOUNT
+# =========================================================
 
 async def connect_user(session):
     global user_client
@@ -127,7 +531,7 @@ async def connect_user(session):
     candidate = TelegramClient(
         StringSession(session.strip()),
         API_ID,
-        API_HASH
+        API_HASH,
     )
 
     try:
@@ -138,12 +542,11 @@ async def connect_user(session):
             return False, "Session is invalid or unauthorized."
 
         me = await candidate.get_me()
-
         if not me:
             await candidate.disconnect()
             return False, "Could not identify the account."
 
-        # Register outgoing user commands.
+        # Register handlers only after successful authorization.
         @candidate.on(events.NewMessage(outgoing=True))
         async def outgoing_commands(event):
             try:
@@ -151,7 +554,6 @@ async def connect_user(session):
             except Exception as exc:
                 print("Command handler error:", type(exc).__name__)
 
-        # Reply to private messages while AFK.
         @candidate.on(events.NewMessage(incoming=True))
         async def incoming_afk(event):
             if not afk_reason or event.out or not event.is_private:
@@ -176,479 +578,179 @@ async def connect_user(session):
         if candidate.is_connected():
             await candidate.disconnect()
         print("User connection error:", type(exc).__name__)
-        return False, "Could not connect. Check the Render logs."
-
-async def outgoing_commands(event):
-    try:
-        await handle_user_commands(candidate, event)
-    except Exception:
-        # Avoid logging private messages or session credentials.
-        pass
-
-# Auto-reply to private messages while AFK.
-@candidate.on(events.NewMessage(incoming=True))
-async def incoming_afk(event):
-    if not afk_reason or event.out or not event.is_private:
-        return
-
-    if event.sender_id == OWNER_ID:
-        return
-
-    try:
-        await event.reply(f"I'm AFK: {afk_reason}")
-    except Exception:
-        pass
-
-old = user_client
-user_client = candidate
-
-if old and old.is_connected():
-    await old.disconnect()
-
-return True, f"Connected as {me.first_name}."
+        return False, "Could not connect. Check Render logs."
 
 
-        if old and old.is_connected():
-            await old.disconnect()
+# =========================================================
+# MANAGEMENT BOT
+# =========================================================
 
-        return True, f"Connected as {me.first_name}."
-
-    except Exception as exc:
-        if candidate:
-            try:
-                await candidate.disconnect()
-            except Exception:
-                pass
-        # Do not include exception text, credentials, or session data in replies.
-        return False, f"Login failed ({type(exc).__name__}). Check the session and API credentials."
-
-
-async def handle_user_commands(client, event):
-    global afk_reason, autocal, reminder_counter
-
-    text = (event.raw_text or "").strip()
-    if not text:
-        return
-
-    # AFK replies are handled by the incoming-message handler below.
-    if not text.startswith("."):
-        if autocal and re.fullmatch(r"[\d\s.+*/()%\-]+", text):
-            try:
-                result = calculate(text)
-                await event.reply(f"= {result}")
-            except Exception:
-                pass
-        return
-
-    parts = text.split()
-    cmd = parts[0].lower()
-
-    if cmd == ".help":
-        await event.reply(
-            "📋 Commands\n"
-            ".help — command list\n"
-            ".ping — test userbot\n"
-            ".id — chat/user ID\n"
-            ".cal 2+2 — calculator\n"
-            ".autocal on/off — auto-solve sums\n"
-            ".todo text — add task\n"
-            ".todos — list tasks\n"
-            ".done 1 — finish task\n"
-            ".remind 1h text — set reminder\n"
-            ".reminders — list reminders\n"
-            ".afk reason — enable AFK\n"
-            ".back — disable AFK\n"
-            ".purge 10 — delete recent own messages\n"
-            ".cleanall — delete own messages in scan limit\n"
-            ".pfp — download replied user's photo\n"
-            ".block / .unblock — reply to a user\n"
-            ".sticker — convert replied image\n"
-            ".copy — copy replied message\n"
-            ".spam 5 text — repeat (max 20)\n"
-            ".quote text — create quote image\n"
-            ".translate es — translate replied text"
-        )
-
-    elif cmd == ".ping":
-        await event.reply("Pong! 🏓")
-
-    elif cmd == ".id":
-        reply = await event.get_reply_message()
-        sender = await reply.get_sender() if reply else await event.get_sender()
-        await event.reply(
-            f"Chat ID: {event.chat_id}\n"
-            f"User ID: {getattr(sender, 'id', 'N/A')}"
-        )
-
-    elif cmd == ".cal":
-        expression = text[len(parts[0]):].strip()
-        if not expression:
-            await event.reply("Usage: .cal 2+2")
-            return
-        try:
-            await event.reply(f"= {calculate(expression)}")
-        except Exception:
-            await event.reply("Invalid arithmetic expression.")
-
-    elif cmd == ".autocal":
-        if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
-            await event.reply("Usage: .autocal on/off")
-            return
-        autocal = parts[1].lower() == "on"
-        await event.reply(f"Auto-calculation {'enabled' if autocal else 'disabled'}.")
-
-    elif cmd == ".todo":
-        task = text[len(parts[0]):].strip()
-        if not task:
-            await event.reply("Usage: .todo text")
-            return
-        cur = db.execute("INSERT INTO todos(task) VALUES (?)", (task,))
-        db.commit()
-        await event.reply(f"Task #{cur.lastrowid} added.")
-
-    elif cmd == ".todos":
-        rows = db.execute(
-            "SELECT id, task, done FROM todos ORDER BY id DESC LIMIT 50"
-        ).fetchall()
-        await event.reply(
-            "\n".join(
-                f"{'✓' if done else '○'} #{tid}: {task}"
-                for tid, task, done in rows
-            ) if rows else "No to-dos yet."
-        )
-
-    elif cmd == ".done":
-        if len(parts) != 2 or not parts[1].isdigit():
-            await event.reply("Usage: .done 1")
-            return
-        cur = db.execute(
-            "UPDATE todos SET done=1 WHERE id=?", (int(parts[1]),)
-        )
-        db.commit()
-        await event.reply("Task completed." if cur.rowcount else "Task not found.")
-
-    elif cmd == ".remind":
-        match = re.match(r"^\.remind\s+(\d+[smhd]?)\s+(.+)$", text, re.I)
-        if not match:
-            await event.reply("Usage: .remind 30s/10m/1h/2d message")
-            return
-
-        try:
-            seconds = parse_duration(match.group(1))
-        except ValueError:
-            await event.reply("Duration must be from 1 second to 7 days.")
-            return
-
-        reminder_counter += 1
-        rid = reminder_counter
-        message = match.group(2)
-        chat_id = event.chat_id
-        reminders[rid] = {"text": message, "seconds": seconds}
-
-        async def fire_reminder():
-            try:
-                await asyncio.sleep(seconds)
-                await client.send_message(chat_id, f"⏰ Reminder: {message}")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            finally:
-                reminders.pop(rid, None)
-                reminder_tasks.pop(rid, None)
-
-        reminder_tasks[rid] = asyncio.create_task(fire_reminder())
-        await event.reply(f"Reminder #{rid} set.")
-
-    elif cmd == ".reminders":
-        if not reminders:
-            await event.reply("No active reminders.")
-        else:
-            await event.reply("\n".join(
-                f"#{rid}: {item['text']} ({item['seconds']} seconds)"
-                for rid, item in reminders.items()
-            ))
-
-    elif cmd == ".afk":
-        afk_reason = text[len(parts[0]):].strip() or "Away"
-        await event.reply(f"AFK enabled: {afk_reason}")
-
-    elif cmd == ".back":
-        afk_reason = None
-        await event.reply("Welcome back! AFK disabled.")
-
-    elif cmd == ".purge":
-        if len(parts) != 2 or not parts[1].isdigit():
-            await event.reply("Usage: .purge 10")
-            return
-        count = min(int(parts[1]), 100)
-        deleted = 0
-        async for msg in client.iter_messages(event.chat_id, limit=500):
-            if msg.id == event.id:
-                continue
-            if msg.out and deleted < count:
-                try:
-                    await msg.delete()
-                    deleted += 1
-                except Exception:
-                    pass
-            if deleted >= count:
-                break
-        try:
-            await event.delete()
-        except Exception:
-            pass
-        # The command message is deleted too; no confirmation is sent.
-
-    elif cmd == ".cleanall":
-        deleted = 0
-        async for msg in client.iter_messages(event.chat_id, limit=1000):
-            if msg.out:
-                try:
-                    await msg.delete()
-                    deleted += 1
-                except Exception:
-                    pass
-        # Deletes up to 1000 outgoing messages found in the scan.
-
-    elif cmd == ".pfp":
-        reply = await event.get_reply_message()
-        if not reply:
-            await event.reply("Reply to a user's message with .pfp")
-            return
-        sender = await reply.get_sender()
-        photo = await client.download_profile_photo(sender, file=bytes)
-        if photo:
-            await client.send_file(event.chat_id, photo, caption="Profile photo")
-        else:
-            await event.reply("No profile photo found.")
-
-    elif cmd in (".block", ".unblock"):
-        reply = await event.get_reply_message()
-        if not reply:
-            await event.reply(f"Reply to a user's message with {cmd}")
-            return
-        sender = await reply.get_sender()
-        if not sender or getattr(sender, "bot", False):
-            await event.reply("Could not identify a suitable user.")
-            return
-        if cmd == ".block":
-            await client(BlockRequest(sender.id))
-            await event.reply("User blocked.")
-        else:
-            await client(UnblockRequest(sender.id))
-            await event.reply("User unblocked.")
-
-    elif cmd in (".sticker", ".quote"):
-        reply = await event.get_reply_message()
-        if cmd == ".sticker":
-            if not reply or not reply.photo:
-                await event.reply("Reply to a photo with .sticker")
-                return
-            raw = await reply.download_media(file=bytes)
-        else:
-            quote = text[len(parts[0]):].strip()
-            if not quote and reply:
-                quote = reply.message or ""
-            if not quote:
-                await event.reply("Usage: .quote text, or reply to text.")
-                return
-            image = Image.new("RGB", (512, 512), "#20242b")
-            draw = ImageDraw.Draw(image)
-            font = ImageFont.load_default(size=24)
-            words = quote.split()
-            lines, line = [], ""
-            for word in words:
-                if len(line + " " + word) > 28:
-                    lines.append(line)
-                    line = word
-                else:
-                    line = (line + " " + word).strip()
-            if line:
-                lines.append(line)
-            draw.multiline_text((25, 40), "\n".join(lines[:12]), fill="white", font=font, spacing=10)
-            buf = io.BytesIO()
-            image.save(buf, format="WEBP")
-            raw = buf.getvalue()
-
-        try:
-            image = Image.open(io.BytesIO(raw)).convert("RGBA")
-            image.thumbnail((512, 512))
-            output = io.BytesIO()
-            image.save(output, format="WEBP")
-            output.seek(0)
-            output.name = "sticker.webp"
-            await client.send_file(event.chat_id, output, reply_to=event.id)
-        except Exception:
-            await event.reply("Could not create the sticker.")
-
-    elif cmd == ".copy":
-        reply = await event.get_reply_message()
-        if not reply:
-            await event.reply("Reply to a message with .copy")
-            return
-        if reply.message:
-            await client.send_message(event.chat_id, reply.message, reply_to=event.id)
-        elif reply.media:
-            media = await reply.download_media(file=bytes)
-            if media:
-                await client.send_file(
-                    event.chat_id, media,
-                    caption=reply.message or "",
-                    reply_to=event.id,
-                )
-
-    elif cmd == ".spam":
-        if len(parts) < 3 or not parts[1].isdigit():
-            await event.reply("Usage: .spam 5 text (maximum 20)")
-            return
-        count = int(parts[1])
-        if not 1 <= count <= 20:
-            await event.reply("Choose a count from 1 to 20.")
-            return
-        message = text.split(maxsplit=2)[2]
-        for _ in range(count):
-            await client.send_message(event.chat_id, message)
-            await asyncio.sleep(1)
-
-    elif cmd == ".translate":
-        reply = await event.get_reply_message()
-        language = parts[1] if len(parts) > 1 else "en"
-        if reply and reply.message:
-            source_text = reply.message
-        else:
-            match = text.split(maxsplit=2)
-            source_text = match[2] if len(match) == 3 else ""
-        if not source_text:
-            await event.reply("Reply to text with .translate es, or use .translate es hello")
-            return
-        try:
-            translated = await asyncio.to_thread(
-                lambda: GoogleTranslator(
-                    source="auto", target=language
-                ).translate(source_text)
-            )
-            await event.reply(translated or "No translation returned.")
-        except Exception:
-            await event.reply("Translation failed. Try a supported language code, e.g. en, hi, es.")
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Userbot manager online.\n/login — connect account\n/status — connection status\n/help — commands"
+def is_owner(update: Update):
+    return (
+        update.effective_user is not None
+        and update.effective_user.id == OWNER_ID
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        return
+
     await update.effective_message.reply_text(
-        "Management commands:\n/login\n/status\n/cancel\n\n"
-        "Use /login in a private chat to connect your Telethon StringSession."
+        "Telegram manager is online.\n\n"
+        "Use /login to connect your user account.\n"
+        "Use /status to check the connection.\n"
+        "Use /help to see management commands."
     )
 
 
-async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if not user or user.id != OWNER_ID:
-        await update.effective_message.reply_text("Not authorized.")
-        return
-    if not chat or chat.type != "private":
-        await update.effective_message.reply_text("Use /login in a private chat.")
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
         return
 
-    login_waiting.add(user.id)
     await update.effective_message.reply_text(
-        "Send your Telethon StringSession in your next message. "
-        "Use /cancel to stop. Never send it in a group."
+        "/login — connect with a Telethon StringSession\n"
+        "/cancel — cancel login input\n"
+        "/status — show connection status\n\n"
+        "After login, send userbot commands from your own account, "
+        "such as .help, .ping, .cal 2+2, and .todo test."
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user:
-        login_waiting.discard(update.effective_user.id)
+async def login_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        return
+
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "For security, use /login in a private chat."
+        )
+        return
+
+    login_waiting.add(OWNER_ID)
+    await update.effective_message.reply_text(
+        "Send your Telethon StringSession in your next message.\n"
+        "Keep it private: anyone with this session may access your account.\n"
+        "Use /cancel to cancel."
+    )
+
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        return
+
+    login_waiting.discard(OWNER_ID)
     await update.effective_message.reply_text("Login cancelled.")
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
-        await update.effective_message.reply_text("Not authorized.")
+async def receive_session(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
         return
 
-    connected = bool(
-        user_client
-        and user_client.is_connected()
-        and await user_client.is_user_authorized()
-    )
-    await update.effective_message.reply_text(
-        "Userbot connected." if connected else "Userbot disconnected."
-    )
-
-
-async def receive_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not user or user.id not in login_waiting:
-        return
-    if user.id != OWNER_ID or not chat or chat.type != "private":
-        login_waiting.discard(user.id)
+    if OWNER_ID not in login_waiting:
         return
 
-    session = (message.text or "").strip()
+    if update.effective_chat.type != "private":
+        return
+
+    session = (update.effective_message.text or "").strip()
     if not session or session.startswith("/"):
-        await message.reply_text("Send the session as plain text or use /cancel.")
         return
 
-    login_waiting.discard(user.id)
+    login_waiting.discard(OWNER_ID)
 
+    # Delete the session message as soon as possible.
     try:
-        await message.delete()
+        await update.effective_message.delete()
     except Exception:
         pass
 
-    progress = await context.bot.send_message(chat.id, "Validating session…")
-    try:
-        success, result = await connect_user(session)
-    finally:
-        session = ""
-
-    await progress.edit_text(result)
-
-
-async def run_bot():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("login", login))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-        receive_session,
-    ))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+    status_message = await context.bot.send_message(
+        chat_id=OWNER_ID,
+        text="Connecting your Telegram account...",
+    )
 
     try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        success, message = await connect_user(session)
+        await status_message.edit_text(message)
+    except Exception as exc:
+        print("Login error:", type(exc).__name__)
+        await status_message.edit_text(
+            "Login failed. Check the Render logs and try /login again."
+        )
 
+
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        return
+
+    connected = bool(user_client and user_client.is_connected())
+
+    if connected:
+        try:
+            me = await user_client.get_me()
+            label = me.first_name if me else "Unknown"
+            await update.effective_message.reply_text(
+                f"Userbot: connected as {label}"
+            )
+        except Exception:
+            await update.effective_message.reply_text(
+                "Userbot: connected, but account lookup failed."
+            )
+    else:
+        await update.effective_message.reply_text("Userbot: disconnected.")
+
+
+async def error_handler(update, context):
+    error = context.error
+    print("Management bot error:", type(error).__name__)
+
+
+def run_bot():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("login", login_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("status", status_command))
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            receive_session,
+        )
+    )
+
+    application.add_error_handler(error_handler)
+    application.run_polling(drop_pending_updates=True)
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     threading.Thread(target=run_web, daemon=True).start()
-
-    async def start_clients():
-        # Keep Telegram clients and their event handlers on the same event loop.
-        await run_bot()
-
-    asyncio.run(start_clients())
+    run_bot()
 
 
 if __name__ == "__main__":
