@@ -1,254 +1,189 @@
 
-import ast
-import asyncio
+# user_client.py
 import os
 import re
+import asyncio
 import sqlite3
-import time
-from pathlib import Path
+import calendar
+from datetime import datetime
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
+SESSION_STRING = os.environ["TG_STRING_SESSION"]
 
-DATA = Path(os.environ.get("DATA_DIR", "data"))
-DATA.mkdir(parents=True, exist_ok=True)
-DB = DATA / "user.sqlite3"
+DB_PATH = os.environ.get("TODO_DB", "todos.db")
 
-client = TelegramClient(str(DATA / "account"), API_ID, API_HASH)
-owner_id = None
-afk_reason = None
-afk_replied = set()
+client = TelegramClient(
+    StringSession(SESSION_STRING),
+    API_ID,
+    API_HASH,
+)
 
-
-def init_db():
-    with sqlite3.connect(DB) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS todos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                done INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                due INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                sent INTEGER DEFAULT 0
-            )
-        """)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.execute("""
+CREATE TABLE IF NOT EXISTS todos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    task TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+)
+""")
+db.commit()
 
 
-def calc(expression):
-    if len(expression) > 100:
-        raise ValueError("Expression too long")
+def add_todo(user_id, task):
+    cursor = db.execute(
+        "INSERT INTO todos (user_id, task) VALUES (?, ?)",
+        (user_id, task),
+    )
+    db.commit()
+    return cursor.lastrowid
 
-    tree = ast.parse(expression, mode="eval")
-    allowed = (
-        ast.Expression, ast.Constant, ast.BinOp, ast.UnaryOp,
-        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
-        ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Load,
+
+def get_todos(user_id):
+    return db.execute(
+        "SELECT id, task, done FROM todos WHERE user_id=? ORDER BY id",
+        (user_id,),
+    ).fetchall()
+
+
+def finish_todo(user_id, todo_id):
+    cursor = db.execute(
+        "UPDATE todos SET done=1 WHERE id=? AND user_id=?",
+        (todo_id, user_id),
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
+async def help_handler(event):
+    await event.reply(
+        "Commands:\n"
+        ".help - Show commands\n"
+        ".ping - Check response\n"
+        ".id - Show chat and account IDs\n"
+        ".cal - Show this month's calendar\n"
+        ".todo add <task> - Add a task\n"
+        ".todo list - List tasks\n"
+        ".todo done <id> - Complete a task\n"
+        ".remind <minutes> <message> - Set a reminder"
     )
 
-    for node in ast.walk(tree):
-        if not isinstance(node, allowed):
-            raise ValueError("Basic arithmetic only")
-        if isinstance(node, ast.Constant):
-            if type(node.value) not in (int, float):
-                raise ValueError("Numbers only")
-            if abs(node.value) > 10**12:
-                raise ValueError("Number too large")
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
-            if not isinstance(node.right, ast.Constant):
-                raise ValueError("Use a numeric exponent")
-            if abs(node.right.value) > 8:
-                raise ValueError("Exponent too large")
 
-    result = eval(
-        compile(tree, "<calc>", "eval"),
-        {"__builtins__": {}},
-        {},
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.ping$"))
+async def ping_handler(event):
+    await event.reply("Pong!")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.id$"))
+async def id_handler(event):
+    me = await client.get_me()
+    chat = await event.get_chat()
+    await event.reply(
+        f"Your user ID: {me.id}\n"
+        f"Chat ID: {event.chat_id}\n"
+        f"Chat: {getattr(chat, 'title', None) or getattr(chat, 'username', None) or 'Private chat'}"
     )
-    if not isinstance(result, (int, float)) or abs(result) > 10**100:
-        raise ValueError("Result out of range")
-    return result
 
 
-def parse_duration(value):
-    match = re.fullmatch(r"(\d{1,5})([smhd])", value.lower())
-    if not match:
-        raise ValueError("Use 30s, 10m, 2h or 1d")
-    seconds = int(match.group(1)) * {
-        "s": 1, "m": 60, "h": 3600, "d": 86400
-    }[match.group(2)]
-    if not 10 <= seconds <= 30 * 86400:
-        raise ValueError("Duration must be 10 seconds to 30 days")
-    return seconds
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.cal$"))
+async def calendar_handler(event):
+    now = datetime.now()
+    result = calendar.month(now.year, now.month)
+    await event.reply(f"```text\n{result}\n```", parse_mode="md")
 
 
-HELP = """Commands:
-.help
-.ping
-.id
-.cal 2+2
-.todo text
-.todos
-.done 1
-.remind 10m text
-.reminders
-.afk reason
-.back"""
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.todo(?:\s|$)"))
+async def todo_handler(event):
+    me = await client.get_me()
+    parts = event.raw_text.split(maxsplit=2)
 
-
-@client.on(events.NewMessage(outgoing=True))
-async def on_command(event):
-    global afk_reason
-
-    text = (event.raw_text or "").strip()
-    if event.sender_id != owner_id or not text.startswith("."):
+    if len(parts) < 2:
+        await event.reply("Usage: .todo add <task> | .todo list | .todo done <id>")
         return
 
-    command, _, arg = text.partition(" ")
-    command, arg = command.lower(), arg.strip()
+    action = parts[1].lower()
 
-    try:
-        if command == ".help":
-            await event.reply(HELP)
+    if action == "add":
+        if len(parts) < 3 or not parts[2].strip():
+            await event.reply("Usage: .todo add Buy milk")
+            return
+        todo_id = add_todo(me.id, parts[2].strip())
+        await event.reply(f"Added task #{todo_id}.")
 
-        elif command == ".ping":
-            await event.reply("Pong — connected.")
+    elif action == "list":
+        rows = get_todos(me.id)
+        if not rows:
+            await event.reply("Your todo list is empty.")
+            return
 
-        elif command == ".id":
-            await event.reply(
-                f"User ID: `{owner_id}`\nChat ID: `{event.chat_id}`"
+        lines = [
+            f"{'✅' if done else '⬜'} {todo_id}. {task}"
+            for todo_id, task, done in rows
+        ]
+        await event.reply("\n".join(lines))
+
+    elif action == "done":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await event.reply("Usage: .todo done 1")
+            return
+        if finish_todo(me.id, int(parts[2])):
+            await event.reply("Task marked complete.")
+        else:
+            await event.reply("Task not found.")
+
+    else:
+        await event.reply("Use .todo add, .todo list, or .todo done.")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.remind\s+"))
+async def remind_handler(event):
+    match = re.match(
+        r"^\.remind\s+(\d+)\s+(.+)$",
+        event.raw_text,
+        re.DOTALL,
+    )
+    if not match:
+        await event.reply("Usage: .remind 10 Take a break")
+        return
+
+    minutes = int(match.group(1))
+    message = match.group(2).strip()
+
+    if minutes < 1 or minutes > 10080:
+        await event.reply("Choose between 1 minute and 7 days.")
+        return
+
+    await event.reply(f"Reminder set for {minutes} minute(s).")
+
+    async def send_reminder():
+        await asyncio.sleep(minutes * 60)
+        try:
+            await client.send_message(
+                event.chat_id,
+                f"⏰ Reminder: {message}",
             )
+        except Exception as exc:
+            print(f"Could not send reminder: {type(exc).__name__}")
 
-        elif command == ".cal":
-            await event.reply(f"Result: `{calc(arg)}`")
-
-        elif command == ".todo":
-            if not arg:
-                await event.reply("Usage: .todo buy milk")
-                return
-            with sqlite3.connect(DB) as conn:
-                cur = conn.execute(
-                    "INSERT INTO todos(text) VALUES (?)", (arg[:500],)
-                )
-                todo_id = cur.lastrowid
-            await event.reply(f"Added to-do #{todo_id}")
-
-        elif command == ".todos":
-            with sqlite3.connect(DB) as conn:
-                rows = conn.execute(
-                    "SELECT id, text FROM todos WHERE done=0 ORDER BY id"
-                ).fetchall()
-            await event.reply(
-                "\n".join(f"{i}. {t}" for i, t in rows[:50])
-                if rows else "No open to-dos."
-            )
-
-        elif command == ".done":
-            if not arg.isdigit():
-                await event.reply("Usage: .done 1")
-                return
-            with sqlite3.connect(DB) as conn:
-                cur = conn.execute(
-                    "UPDATE todos SET done=1 WHERE id=? AND done=0",
-                    (int(arg),),
-                )
-            await event.reply(
-                "Completed." if cur.rowcount else "To-do not found."
-            )
-
-        elif command == ".remind":
-            parts = arg.split(maxsplit=1)
-            if len(parts) != 2:
-                await event.reply("Usage: .remind 10m take a break")
-                return
-            due = int(time.time()) + parse_duration(parts[0])
-            with sqlite3.connect(DB) as conn:
-                cur = conn.execute(
-                    """INSERT INTO reminders(text, due, chat_id)
-                       VALUES (?, ?, ?)""",
-                    (parts[1][:500], due, event.chat_id),
-                )
-                reminder_id = cur.lastrowid
-            await event.reply(f"Reminder #{reminder_id} created.")
-
-        elif command == ".reminders":
-            with sqlite3.connect(DB) as conn:
-                rows = conn.execute(
-                    """SELECT id, text, due FROM reminders
-                       WHERE sent=0 ORDER BY due LIMIT 30"""
-                ).fetchall()
-            now = int(time.time())
-            await event.reply(
-                "\n".join(
-                    f"#{i}: {t} (in {max(0, due-now)} sec)"
-                    for i, t, due in rows
-                ) if rows else "No pending reminders."
-            )
-
-        elif command == ".afk":
-            afk_reason = arg[:300] or "Away"
-            afk_replied.clear()
-            await event.reply(f"AFK enabled: {afk_reason}")
-
-        elif command == ".back":
-            afk_reason = None
-            afk_replied.clear()
-            await event.reply("AFK disabled.")
-
-    except (ValueError, SyntaxError, ZeroDivisionError, OverflowError) as exc:
-        await event.reply(f"Error: {exc}")
-
-
-@client.on(events.NewMessage(incoming=True))
-async def on_incoming(event):
-    if (
-        afk_reason
-        and event.is_private
-        and event.sender_id != owner_id
-        and event.sender_id not in afk_replied
-    ):
-        afk_replied.add(event.sender_id)
-        await event.reply(f"I'm away: {afk_reason}")
-
-
-async def reminder_loop():
-    while True:
-        now = int(time.time())
-        with sqlite3.connect(DB) as conn:
-            rows = conn.execute(
-                """SELECT id, text, chat_id FROM reminders
-                   WHERE sent=0 AND due<=? LIMIT 20""",
-                (now,),
-            ).fetchall()
-            for reminder_id, _, _ in rows:
-                conn.execute(
-                    "UPDATE reminders SET sent=1 WHERE id=?",
-                    (reminder_id,),
-                )
-
-        for reminder_id, text, chat_id in rows:
-            try:
-                await client.send_message(chat_id, f"⏰ Reminder: {text}")
-            except Exception as exc:
-                print(f"Reminder {reminder_id} failed: {exc}")
-
-        await asyncio.sleep(5)
+    asyncio.create_task(send_reminder())
 
 
 async def main():
-    global owner_id
-    init_db()
-    await client.start()
-    owner_id = (await client.get_me()).id
-    print(f"Connected as Telegram user ID {owner_id}")
-    asyncio.create_task(reminder_loop())
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError(
+            "Telegram session is not authorized. "
+            "Generate a valid session locally."
+        )
+
+    me = await client.get_me()
+    print(f"Connected as Telegram user ID {me.id}")
     await client.run_until_disconnected()
 
 
