@@ -95,40 +95,69 @@ LANGUAGE_CODES = {
 }
 
 async def translate_text(target, source_text):
-    target = LANGUAGE_ALIASES.get(target.lower().strip(), target.lower().strip())
-    if not source_text.strip():
+    """Translate text with multiple fallbacks and useful provider diagnostics."""
+    requested = (target or "").lower().strip()
+    target = LANGUAGE_ALIASES.get(requested, requested)
+    target_code = LANGUAGE_CODES.get(target, requested)
+    source_text = (source_text or "").strip()
+    if not source_text:
         raise ValueError("No text was provided to translate.")
 
-    def try_google():
-        return GoogleTranslator(source="auto", target=target).translate(source_text)
+    errors = []
 
-    def try_mymemory():
-        target_code = LANGUAGE_CODES.get(target, target)
-        params = urllib.parse.urlencode({"q": source_text, "langpair": f"autodetect|{target_code}"})
+    # Provider 1: deep-translator's Google backend, trying name and ISO code.
+    for google_target in dict.fromkeys((target, target_code)):
+        try:
+            result = await asyncio.to_thread(
+                lambda t=google_target: GoogleTranslator(source="auto", target=t).translate(source_text)
+            )
+            if result and result.strip():
+                return result.strip()
+            errors.append("GoogleTranslator returned an empty result")
+        except Exception as exc:
+            errors.append(f"GoogleTranslator/{google_target}: {type(exc).__name__}")
+
+    # Provider 2: Google's lightweight endpoint with automatic source detection.
+    try:
+        params = urllib.parse.urlencode({
+            "client": "gtx", "sl": "auto", "tl": target_code, "dt": "t", "q": source_text
+        })
         request = urllib.request.Request(
-            "https://api.mymemory.translated.net/get?" + params,
+            "https://translate.googleapis.com/translate_a/single?" + params,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(request, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        result = data.get("responseData", {}).get("translatedText")
-        if not result:
-            raise RuntimeError("MyMemory returned no translation")
-        return result
+        with urllib.request.urlopen(request, timeout=18) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        translated = "".join(part[0] for part in (payload[0] or []) if part and part[0])
+        if translated.strip():
+            return translated.strip()
+        errors.append("Google endpoint returned an empty result")
+    except Exception as exc:
+        errors.append(f"Google endpoint: {type(exc).__name__}")
 
-    try:
-        result = await asyncio.to_thread(try_google)
-        if result and result.strip():
-            return result
-    except Exception as exc:
-        log.warning("Google translation failed: %s", type(exc).__name__)
-    try:
-        result = await asyncio.to_thread(try_mymemory)
-        if result and result.strip():
-            return result
-    except Exception as exc:
-        log.warning("MyMemory translation failed: %s", type(exc).__name__)
-    raise RuntimeError("Both translation providers failed. Check Render logs and network access.")
+    # Provider 3: MyMemory fallback. The service may reject autodetect, so try it
+    # first and then English as a last resort for English source text.
+    for source_code in ("autodetect", "en"):
+        try:
+            params = urllib.parse.urlencode({
+                "q": source_text, "langpair": f"{source_code}|{target_code}"
+            })
+            request = urllib.request.Request(
+                "https://api.mymemory.translated.net/get?" + params,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            result = data.get("responseData", {}).get("translatedText")
+            status = data.get("responseStatus")
+            if result and str(status or 200) == "200" and result.strip():
+                return result.strip()
+            errors.append(f"MyMemory ({source_code}): API status {status}; no usable translation")
+        except Exception as exc:
+            errors.append(f"MyMemory/{source_code}: {type(exc).__name__}")
+
+    log.error("All translation providers failed: %s", " | ".join(errors))
+    raise RuntimeError("All translation providers failed; check Render logs for provider details.")
 
 # Calculator accepts only arithmetic syntax; no names, calls, or attributes.
 def safe_calculate(expression):
@@ -205,15 +234,29 @@ def make_quote_sticker(text, name, avatar_bytes=None):
     words = text.split()
     lines, line = [], ""
     for word in words:
-        test = f"{line} {word}".strip()
-        if draw.textbbox((0, 0), test, font=font)[2] <= 420:
-            line = test
-        else:
-            if line: lines.append(line)
-            line = word
-    if line: lines.append(line)
+        # Break unusually long tokens (such as URLs) to prevent overflow.
+        chunks, chunk = [], ""
+        for char in word:
+            if draw.textbbox((0, 0), chunk + char, font=font)[2] > 410 and chunk:
+                chunks.append(chunk)
+                chunk = char
+            else:
+                chunk += char
+        if chunk:
+            chunks.append(chunk)
+        for piece in chunks:
+            test = f"{line} {piece}".strip()
+            if draw.textbbox((0, 0), test, font=font)[2] <= 420:
+                line = test
+            else:
+                if line:
+                    lines.append(line)
+                line = piece
+    if line:
+        lines.append(line)
     if len(lines) > 8:
-        lines = lines[:8]; lines[-1] = lines[-1][:35] + "…"
+        lines = lines[:8]
+        lines[-1] = lines[-1][:35] + "…"
     y = 166
     for line in lines:
         draw.text((46, y), line, font=font, fill=(240, 242, 248, 255)); y += 38
@@ -266,7 +309,30 @@ async def connect_user(session_string):
         arg = parts[1] if len(parts) > 1 else ""
         try:
             if command == "help":
-                await event.reply("**Userbot commands**\n.help .ping .id .info .cal .autocal\n.todo .todos .done .remind .reminders\n.afk .back .pfp .sticker .quote\n.block .unblock .copy .translate (reply + language) .purge .cleanall .spam")
+                help_text = (
+                    "✨ **USERBOT COMMANDS**\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "📌 **General**\n"
+                    "`.ping` · `.id` · `.info` · `.help`\n"
+                    "🧮 **Tools**\n"
+                    "`.cal 2+2` · `.autocal`\n"
+                    "`.translate hindi` — reply to a text message\n"
+                    "📋 **Tasks & reminders**\n"
+                    "`.todo task` · `.todos` · `.done ID`\n"
+                    "`.remind 10m text` · `.reminders`\n"
+                    "👤 **Profile & status**\n"
+                    "`.afk reason` · `.back` · `.pfp`\n"
+                    "🖼️ **Media**\n"
+                    "`.sticker` — reply to an image\n"
+                    "`.quote` — reply to a text message\n"
+                    "`.copy` — reply to a message\n"
+                    "🛡️ **Moderation**\n"
+                    "`.block` · `.unblock @user` · `.purge 10`\n"
+                    "`.cleanall 30` · `.spam 3 hello`\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "Commands work from your connected Telegram account."
+                )
+                await event.reply(help_text)
             elif command == "ping":
                 start = time.monotonic(); msg = await event.reply("Pong!")
                 await msg.edit(f"Pong! `{(time.monotonic()-start)*1000:.0f} ms`")
@@ -344,9 +410,14 @@ async def connect_user(session_string):
                 if not reply or not (reply.raw_text or "").strip(): await event.reply("Reply to a text message with `.quote`."); return
                 sender = await reply.get_sender()
                 name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or "Telegram user"
-                avatar = await event.client.download_profile_photo(sender, file=bytes)
+                try:
+                    avatar = await event.client.download_profile_photo(sender, file=bytes)
+                except Exception:
+                    log.exception("Could not download avatar for .quote; generating quote without avatar")
+                    avatar = None
                 sticker = make_quote_sticker(reply.raw_text.strip(), name, avatar)
-                await send_sticker(event.client, event.chat_id, sticker, alt="💬", reply_to=event.id)
+                # Reply to the original message being quoted, not to the .quote command itself.
+                await send_sticker(event.client, event.chat_id, sticker, alt="💬", reply_to=reply.id)
             elif command == "block":
                 reply = await event.get_reply_message()
                 target = arg or (str((await reply.get_sender()).id) if reply else "")
