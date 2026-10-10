@@ -5,6 +5,19 @@ import sqlite3
 import threading
 from datetime import datetime
 
+import ast
+import io
+import math
+import operator
+import re
+import asyncio
+
+from PIL import Image, ImageDraw, ImageFont
+from deep_translator import GoogleTranslator
+from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
+from telethon.tl.types import DocumentAttributeSticker, InputStickerSetEmpty
+
+
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
