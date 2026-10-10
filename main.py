@@ -1,1071 +1,507 @@
-
 import os
+import re
+import io
 import ast
-import operator
+import math
+import json
+import time
 import asyncio
 import sqlite3
-import threading
-import io
-import re
-import textwrap
-from datetime import datetime
+import logging
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
 
-from flask import Flask, jsonify
-from telethon import TelegramClient, events
+from flask import Flask
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+from deep_translator import GoogleTranslator
+from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeSticker,
     DocumentAttributeImageSize,
-    DocumentAttributeFilename,
     InputStickerSetEmpty,
 )
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from deep_translator import GoogleTranslator
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-
-# =========================================================
-# CONFIGURATION
-# =========================================================
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("userbot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("TG_API_ID", "0"))
-API_HASH = os.getenv("TG_API_HASH", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+TG_API_ID = os.getenv("TG_API_ID", "").strip()
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+OWNER_ID = os.getenv("OWNER_ID", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing.")
-if not API_ID or not API_HASH:
-    raise RuntimeError("TG_API_ID or TG_API_HASH is missing.")
-if not OWNER_ID:
-    raise RuntimeError("OWNER_ID is missing.")
+if not BOT_TOKEN or not TG_API_ID or not TG_API_HASH or not OWNER_ID:
+    log.warning("Set BOT_TOKEN, TG_API_ID, TG_API_HASH and OWNER_ID in Render environment variables.")
+
+try:
+    API_ID = int(TG_API_ID)
+    OWNER_ID_INT = int(OWNER_ID)
+except ValueError:
+    API_ID = 0
+    OWNER_ID_INT = 0
 
 app = Flask(__name__)
 
-user_client = None
-login_waiting = set()
-afk_reason = None
-autocal = False
-reminder_counter = 0
-reminder_tasks = {}
-
-DB_PATH = "todos.db"
-
-
-# =========================================================
-# WEB SERVER
-# =========================================================
-
-@app.route("/")
+@app.get("/")
 def home():
-    return "Telegram manager is running."
+    return "Userbot is running", 200
 
-
-@app.route("/health")
+@app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "userbot_connected": bool(
-            user_client and user_client.is_connected()
-        ),
-    })
+    return {"status": "ok", "user_connected": bool(user_client and user_client.is_connected())}, 200
 
+user_client = None
+login_sessions = {}
+afk_state = {}
 
-def run_web():
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+DB_PATH = os.getenv("DB_PATH", "userbot.db")
 
-
-# =========================================================
-# TODO DATABASE
-# =========================================================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS todos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL,
-                task TEXT NOT NULL,
-                done INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-
-def add_todo(task):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            """INSERT INTO todos
-               (owner_id, task, done, created_at)
-               VALUES (?, ?, 0, ?)""",
-            (
-                OWNER_ID,
-                task,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-        return cur.lastrowid
-
-
-def get_todos():
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            """SELECT id, task FROM todos
-               WHERE owner_id = ? AND done = 0 ORDER BY id""",
-            (OWNER_ID,),
-        ).fetchall()
-
-
-def finish_todo(todo_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            """UPDATE todos SET done = 1
-               WHERE id = ? AND owner_id = ? AND done = 0""",
-            (todo_id, OWNER_ID),
-        )
-        return cur.rowcount > 0
-
-
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, task TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, owner INTEGER NOT NULL, text TEXT NOT NULL, due REAL NOT NULL, sent INTEGER NOT NULL DEFAULT 0)")
 init_db()
 
-
-# =========================================================
-# CALCULATOR AND DURATION PARSER
-# =========================================================
-
-_ALLOWED_OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-    ast.UAdd: operator.pos,
+LANGUAGE_ALIASES = {
+    "en": "english", "hi": "hindi", "bn": "bengali", "ta": "tamil", "te": "telugu",
+    "mr": "marathi", "gu": "gujarati", "pa": "punjabi", "ur": "urdu", "es": "spanish",
+    "fr": "french", "de": "german", "it": "italian", "pt": "portuguese", "ru": "russian",
+    "ja": "japanese", "ko": "korean", "zh": "chinese", "ar": "arabic", "id": "indonesian",
+    "tr": "turkish", "vi": "vietnamese", "th": "thai", "ne": "nepali", "ml": "malayalam",
+    "kn": "kannada", "or": "odia", "as": "assamese"
 }
 
+async def translate_text(target, source_text):
+    target = LANGUAGE_ALIASES.get(target.lower().strip(), target.lower().strip())
+    if not source_text.strip():
+        raise ValueError("No text was provided to translate.")
 
-def calculate(expression):
-    tree = ast.parse(expression, mode="eval")
+    def try_google():
+        return GoogleTranslator(source="auto", target=target).translate(source_text)
 
-    def evaluate(node):
-        if isinstance(node, ast.Expression):
-            return evaluate(node.body)
+    def try_mymemory():
+        params = urllib.parse.urlencode({"q": source_text, "langpair": f"autodetect|{target}"})
+        request = urllib.request.Request(
+            "https://api.mymemory.translated.net/get?" + params,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        result = data.get("responseData", {}).get("translatedText")
+        if not result:
+            raise RuntimeError("MyMemory returned no translation")
+        return result
 
-        if isinstance(node, ast.Constant):
-            if type(node.value) in (int, float):
-                return node.value
-            raise ValueError("Invalid number.")
-
-        if isinstance(node, ast.BinOp):
-            op_type = type(node.op)
-            if op_type not in _ALLOWED_OPERATORS:
-                raise ValueError("Unsupported operator.")
-
-            left = evaluate(node.left)
-            right = evaluate(node.right)
-
-            if isinstance(node.op, ast.Pow) and abs(right) > 100:
-                raise ValueError("Exponent too large.")
-
-            result = _ALLOWED_OPERATORS[op_type](left, right)
-
-            if isinstance(result, (int, float)) and abs(result) > 1e100:
-                raise ValueError("Result too large.")
-
+    try:
+        result = await asyncio.to_thread(try_google)
+        if result and result.strip():
             return result
+    except Exception as exc:
+        log.warning("Google translation failed: %s", type(exc).__name__)
+    try:
+        result = await asyncio.to_thread(try_mymemory)
+        if result and result.strip():
+            return result
+    except Exception as exc:
+        log.warning("MyMemory translation failed: %s", type(exc).__name__)
+    raise RuntimeError("Both translation providers failed. Check Render logs and network access.")
 
-        if isinstance(node, ast.UnaryOp):
-            op_type = type(node.op)
-            if op_type not in _ALLOWED_OPERATORS:
-                raise ValueError("Unsupported operator.")
-            return _ALLOWED_OPERATORS[op_type](evaluate(node.operand))
+# Calculator accepts only arithmetic syntax; no names, calls, or attributes.
+def safe_calculate(expression):
+    tree = ast.parse(expression, mode="eval")
+    allowed = (ast.Expression, ast.Constant, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult,
+               ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Load, ast.LShift, ast.RShift)
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed):
+            raise ValueError("Only basic arithmetic is allowed")
+        if isinstance(node, ast.Constant) and (not isinstance(node.value, (int, float)) or isinstance(node.value, bool)):
+            raise ValueError("Invalid number")
+        if isinstance(node, ast.Pow) and isinstance(getattr(node, "parent", None), ast.AST):
+            pass
+    value = eval(compile(tree, "<calculator>", "eval"), {"__builtins__": {}}, {})
+    if isinstance(value, complex) or not math.isfinite(float(value)):
+        raise ValueError("Invalid result")
+    return value
 
-        raise ValueError("Invalid expression.")
-
-    return evaluate(tree)
-
-
-def parse_duration(value):
-    match = re.fullmatch(
-        r"\s*(\d+(?:\.\d+)?)\s*"
-        r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes|"
-        r"h|hr|hrs|hour|hours|d|day|days)\s*",
-        value.lower(),
-    )
-
+def parse_duration(text):
+    match = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", text.lower())
     if not match:
-        raise ValueError("Use a duration like 30s, 10m, 2h, or 1d.")
-
-    number = float(match.group(1))
-    unit = match.group(2)
-
-    if unit in ("s", "sec", "secs", "second", "seconds"):
-        multiplier = 1
-    elif unit in ("m", "min", "mins", "minute", "minutes"):
-        multiplier = 60
-    elif unit in ("h", "hr", "hrs", "hour", "hours"):
-        multiplier = 3600
-    else:
-        multiplier = 86400
-
-    seconds = number * multiplier
-
-    if seconds < 1 or seconds > 7 * 86400:
-        raise ValueError("Duration must be between 1 second and 7 days.")
-
-    return seconds
-
-
-# =========================================================
-# IMAGE AND STICKER HELPERS
-# =========================================================
+        raise ValueError("Use a duration such as 30s, 10m, 2h or 1d")
+    n = int(match.group(1)); unit = match.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 def load_font(size):
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "arial.ttf",
-    ):
+    for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"):
         try:
             return ImageFont.truetype(path, size)
         except OSError:
             continue
-
     return ImageFont.load_default()
 
-
 def make_sticker_image(image_bytes):
-    """Convert a supported image into a 512x512 WebP sticker image."""
-    with Image.open(io.BytesIO(image_bytes)) as original:
-        image = ImageOps.exif_transpose(original).convert("RGBA")
-
-    image.thumbnail((512, 512), Image.Resampling.LANCZOS)
-
+    im = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    im.thumbnail((512, 512), Image.Resampling.LANCZOS)
     canvas = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
-    x = (512 - image.width) // 2
-    y = (512 - image.height) // 2
-    canvas.alpha_composite(image, (x, y))
+    canvas.alpha_composite(im, ((512 - im.width) // 2, (512 - im.height) // 2))
+    out = io.BytesIO(); canvas.save(out, "WEBP", lossless=True, quality=95, method=6); out.seek(0)
+    return out
 
-    output = io.BytesIO()
-    canvas.save(output, format="WEBP", quality=90, method=6)
-    output.seek(0)
-    return output
-
-
-def make_quote_sticker(name, quote_text, photo_bytes=None):
-    """Create a 512x512 quote sticker with a sender avatar and name."""
-    canvas = Image.new("RGBA", (512, 512), (27, 30, 43, 255))
+def make_quote_sticker(text, name, avatar_bytes=None):
+    size = (512, 512)
+    canvas = Image.new("RGBA", size, (25, 28, 38, 255))
     draw = ImageDraw.Draw(canvas)
-
-    white = (255, 255, 255, 255)
-    accent = (110, 190, 255, 255)
-    muted = (190, 200, 220, 255)
-
-    # Rounded card background.
-    draw.rounded_rectangle(
-        (12, 12, 500, 500),
-        radius=30,
-        fill=(37, 42, 59, 255),
-        outline=(90, 110, 145, 255),
-        width=3,
-    )
-
-    # Sender avatar.
-    avatar = None
-
-    if photo_bytes:
+    # subtle rounded card
+    draw.rounded_rectangle((18, 18, 494, 494), radius=32, fill=(36, 41, 55, 255), outline=(90, 102, 130, 255), width=3)
+    if avatar_bytes:
         try:
-            with Image.open(io.BytesIO(photo_bytes)) as source:
-                avatar = ImageOps.fit(
-                    source.convert("RGBA"),
-                    (100, 100),
-                    method=Image.Resampling.LANCZOS,
-                )
+            avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
+            avatar = ImageOps.fit(avatar, (76, 76), method=Image.Resampling.LANCZOS)
+            mask = Image.new("L", (76, 76), 0); ImageDraw.Draw(mask).ellipse((0, 0, 75, 75), fill=255)
+            canvas.paste(avatar, (42, 42), mask)
         except Exception:
-            avatar = None
-
-    if avatar is None:
-        avatar = Image.new("RGBA", (100, 100), (80, 105, 155, 255))
-        avatar_draw = ImageDraw.Draw(avatar)
-        initial = (name[:1] or "?").upper()
-        avatar_draw.text(
-            (50, 50),
-            initial,
-            font=load_font(44),
-            fill=white,
-            anchor="mm",
-        )
-
-    mask = Image.new("L", (100, 100), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, 99, 99), fill=255)
-    canvas.paste(avatar, (35, 35), mask)
-
-    name_font = load_font(27)
-    quote_font = load_font(25)
-
-    display_name = name or "Unknown user"
-    while draw.textbbox((0, 0), display_name, font=name_font)[2] > 335:
-        if len(display_name) <= 4:
-            break
-        display_name = display_name[:-2] + "…"
-
-    draw.text((155, 48), display_name, font=name_font, fill=accent)
-
-    # Wrap text based on actual rendered width.
-    words = quote_text.split()
-    lines = []
-    current = ""
-
+            pass
+    draw.text((134, 58), name[:28], font=load_font(24), fill=(255, 255, 255, 255))
+    draw.line((42, 140, 470, 140), fill=(100, 113, 143, 255), width=2)
+    font = load_font(27)
+    words = text.split()
+    lines, line = [], ""
     for word in words:
-        candidate = f"{current} {word}".strip()
-        if draw.textbbox((0, 0), candidate, font=quote_font)[2] <= 420:
-            current = candidate
+        test = f"{line} {word}".strip()
+        if draw.textbbox((0, 0), test, font=font)[2] <= 420:
+            line = test
         else:
-            if current:
-                lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    if not lines:
-        lines = [" "]
-
-    # Limit sticker text to fit; preserve a readable result.
-    max_lines = 10
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1][:35] + "…"
-
-    line_height = 34
-    available_height = 355
-    if len(lines) * line_height > available_height:
-        quote_font = load_font(21)
-        line_height = 29
-
-    y = 165
-    draw.text((38, 135), "❝", font=load_font(38), fill=accent)
-
+            if line: lines.append(line)
+            line = word
+    if line: lines.append(line)
+    if len(lines) > 8:
+        lines = lines[:8]; lines[-1] = lines[-1][:35] + "…"
+    y = 166
     for line in lines:
-        if y > 460:
-            break
-        draw.text((45, y), line, font=quote_font, fill=white)
-        y += line_height
+        draw.text((46, y), line, font=font, fill=(240, 242, 248, 255)); y += 38
+    out = io.BytesIO(); canvas.save(out, "WEBP", lossless=True, quality=95, method=6); out.seek(0)
+    return out
 
-    draw.text(
-        (38, 462),
-        "TELEGRAM QUOTE",
-        font=load_font(14),
-        fill=muted,
-    )
-
-    output = io.BytesIO()
-    canvas.save(output, format="WEBP", quality=90, method=6)
-    output.seek(0)
-    return output
-
-
-async def send_sticker(client, chat_id, sticker_data):
-    sticker_data.seek(0)
-    sticker_data.name = "sticker.webp"
-
-    attributes = [
-        DocumentAttributeSticker(
-            alt="🙂",
-            stickerset=InputStickerSetEmpty(),
-        ),
-        DocumentAttributeImageSize(w=512, h=512),
-        DocumentAttributeFilename("sticker.webp"),
-    ]
-
+async def send_sticker(client, chat_id, webp_buffer, alt="🙂", reply_to=None):
+    # Telegram stickers are documents with sticker attributes; these attributes make Telegram render it as a sticker.
+    webp_buffer.seek(0)
     await client.send_file(
         chat_id,
-        sticker_data,
-        force_document=True,
+        webp_buffer,
+        file_name="sticker.webp",
         mime_type="image/webp",
-        attributes=attributes,
+        force_document=True,
+        attributes=[
+            DocumentAttributeImageSize(w=512, h=512),
+            DocumentAttributeSticker(alt=alt[:64], stickerset=InputStickerSetEmpty()),
+        ],
+        reply_to=reply_to,
     )
 
-
-async def get_profile_photo_bytes(client, entity):
+async def get_reply_image_bytes(event):
+    if not event.is_reply:
+        return None
+    msg = await event.get_reply_message()
+    if not msg or not msg.media:
+        return None
     try:
-        result = await client.download_profile_photo(entity, file=bytes)
-        return result if isinstance(result, bytes) else None
+        return await event.client.download_media(msg, file=bytes)
     except Exception:
         return None
 
-
-# =========================================================
-# TRANSLATION
-# =========================================================
-
-LANGUAGE_ALIASES = {
-    "english": "en",
-    "hindi": "hi",
-    "spanish": "es",
-    "french": "fr",
-    "german": "de",
-    "italian": "it",
-    "portuguese": "pt",
-    "russian": "ru",
-    "japanese": "ja",
-    "korean": "ko",
-    "chinese": "zh-CN",
-    "arabic": "ar",
-    "bengali": "bn",
-    "urdu": "ur",
-    "punjabi": "pa",
-    "tamil": "ta",
-    "telugu": "te",
-    "marathi": "mr",
-    "gujarati": "gu",
-    "dutch": "nl",
-    "turkish": "tr",
-    "indonesian": "id",
-    "thai": "th",
-    "vietnamese": "vi",
-    "ukrainian": "uk",
-    "persian": "fa",
-    "hebrew": "iw",
-}
-
-
-async def translate_text(target, source_text):
-    target = LANGUAGE_ALIASES.get(target.lower(), target)
-
-    def do_translate():
-        translator = GoogleTranslator(source="auto", target=target)
-        return translator.translate(source_text)
-
-    return await asyncio.to_thread(do_translate)
-
-
-# =========================================================
-# USERBOT COMMAND HANDLER
-# =========================================================
-
-async def handle_user_commands(client, event):
-    global afk_reason, autocal, reminder_counter
-
-    text = (event.raw_text or "").strip()
-    if not text:
-        return
-
-    parts = text.split(maxsplit=1)
-    command = parts[0].lower()
-    argument = parts[1].strip() if len(parts) > 1 else ""
-
-    if not command.startswith("."):
-        if autocal:
-            try:
-                await event.reply(f"= {calculate(text)}")
-            except Exception:
-                pass
-        return
-
-    # ---------------- HELP ----------------
-    if command == ".help":
-        await event.reply(
-            "**Userbot Commands**\n\n"
-            "`.help` — command list\n"
-            "`.ping` — connection test\n"
-            "`.id` — chat and sender IDs\n"
-            "`.info` — user details; reply to a user's message\n"
-            "`.cal 2+2` — calculator\n"
-            "`.autocal on/off` — automatic calculation\n"
-            "`.todo task` — add a task\n"
-            "`.todos` — list unfinished tasks\n"
-            "`.done 1` — complete a task\n"
-            "`.remind 10m take a break` — reminder\n"
-            "`.reminders` — list active reminders\n"
-            "`.afk reason` / `.back` — AFK mode\n"
-            "`.purge 10` — delete up to 10 of your messages\n"
-            "`.cleanall` — delete up to 100 of your messages\n"
-            "`.pfp` — send this chat's profile photo\n"
-            "Reply to an image with `.sticker` — image sticker\n"
-            "Reply to text with `.quote` — quote sticker\n"
-            "Reply to a user with `.block` / `.unblock`\n"
-            "`.copy` — copy replied text\n"
-            "`.translate es Hello` — translate text\n"
-            "`.spam 3 Hello` — send up to 5 messages"
-        )
-        return
-
-    if command == ".ping":
-        await event.reply("Pong!")
-        return
-
-    if command == ".id":
-        reply = await event.get_reply_message()
-        await event.reply(
-            f"Chat ID: `{event.chat_id}`\n"
-            f"Sender ID: `{reply.sender_id if reply else event.sender_id}`"
-        )
-        return
-
-    # ---------------- USER INFO ----------------
-    if command == ".info":
-        reply = await event.get_reply_message()
-
-        try:
-            if reply:
-                entity = await reply.get_sender()
-            elif event.is_private:
-                entity = await event.get_chat()
-            else:
-                await event.reply(
-                    "Reply to the user's message with `.info`."
-                )
-                return
-
-            if not entity or not getattr(entity, "id", None):
-                await event.reply("Couldn't identify that user.")
-                return
-
-            user_id = entity.id
-            first = getattr(entity, "first_name", None) or ""
-            last = getattr(entity, "last_name", None) or ""
-            name = f"{first} {last}".strip() or getattr(
-                entity, "title", "Unknown"
-            )
-            username = getattr(entity, "username", None)
-            username_text = f"@{username}" if username else "None"
-            permanent_link = f"tg://user?id={user_id}"
-
-            await event.reply(
-                "**User Information**\n"
-                f"Name: {name}\n"
-                f"User ID: `{user_id}`\n"
-                f"Username: {username_text}\n"
-                f"Permanent link: `{permanent_link}`"
-            )
-        except Exception as exc:
-            print("Info command error:", type(exc).__name__)
-            await event.reply("Couldn't retrieve user information.")
-        return
-
-    # ---------------- CALCULATOR ----------------
-    if command == ".cal":
-        if not argument:
-            await event.reply("Usage: `.cal 2+2`")
-            return
-        try:
-            await event.reply(f"= {calculate(argument)}")
-        except Exception:
-            await event.reply("Invalid calculation.")
-        return
-
-    if command == ".autocal":
-        value = argument.lower()
-        if value not in ("on", "off"):
-            await event.reply("Usage: `.autocal on` or `.autocal off`")
-            return
-        autocal = value == "on"
-        await event.reply(f"Auto-calculator: {'ON' if autocal else 'OFF'}")
-        return
-
-    # ---------------- TODO ----------------
-    if command == ".todo":
-        if not argument:
-            await event.reply("Usage: `.todo Buy groceries`")
-            return
-        todo_id = add_todo(argument)
-        await event.reply(f"Added task #{todo_id}: {argument}")
-        return
-
-    if command == ".todos":
-        todos = get_todos()
-        if not todos:
-            await event.reply("No unfinished tasks.")
-            return
-        await event.reply(
-            "**Your tasks**\n" +
-            "\n".join(f"#{row[0]} — {row[1]}" for row in todos)
-        )
-        return
-
-    if command == ".done":
-        try:
-            todo_id = int(argument)
-        except ValueError:
-            await event.reply("Usage: `.done 1`")
-            return
-        await event.reply(
-            f"Task #{todo_id} completed."
-            if finish_todo(todo_id)
-            else "Task not found or already completed."
-        )
-        return
-
-    # ---------------- REMINDERS ----------------
-    if command == ".remind":
-        args = argument.split(maxsplit=1)
-        if len(args) != 2:
-            await event.reply("Usage: `.remind 10m take a break`")
-            return
-
-        try:
-            seconds = parse_duration(args[0])
-        except ValueError as exc:
-            await event.reply(str(exc))
-            return
-
-        reminder_counter += 1
-        reminder_id = reminder_counter
-        chat_id = event.chat_id
-        reminder_text = args[1]
-
-        async def fire_reminder():
-            try:
-                await asyncio.sleep(seconds)
-                await client.send_message(
-                    chat_id,
-                    f"⏰ Reminder #{reminder_id}: {reminder_text}",
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                print("Reminder error:", type(exc).__name__)
-            finally:
-                reminder_tasks.pop(reminder_id, None)
-
-        task = asyncio.create_task(fire_reminder())
-        reminder_tasks[reminder_id] = {
-            "task": task,
-            "text": reminder_text,
-        }
-        await event.reply(f"Reminder #{reminder_id} set.")
-        return
-
-    if command == ".reminders":
-        if not reminder_tasks:
-            await event.reply("No active reminders.")
-            return
-        await event.reply(
-            "**Active reminders**\n" +
-            "\n".join(
-                f"#{rid}: {info['text']}"
-                for rid, info in reminder_tasks.items()
-            )
-        )
-        return
-
-    # ---------------- AFK ----------------
-    if command == ".afk":
-        afk_reason = argument or "Away"
-        await event.reply(f"AFK enabled: {afk_reason}")
-        return
-
-    if command == ".back":
-        afk_reason = None
-        await event.reply("Welcome back! AFK disabled.")
-        return
-
-    # ---------------- PROFILE PHOTO ----------------
-    if command == ".pfp":
-        try:
-            chat = await event.get_chat()
-            photo = await get_profile_photo_bytes(client, chat)
-
-            if not photo:
-                await event.reply("This chat has no accessible profile photo.")
-                return
-
-            await client.send_file(
-                event.chat_id,
-                photo,
-                caption="Profile picture",
-            )
-        except Exception as exc:
-            print("PFP command error:", type(exc).__name__)
-            await event.reply("Could not download the chat profile picture.")
-        return
-
-    # ---------------- IMAGE TO STICKER ----------------
-    if command == ".sticker":
-        reply = await event.get_reply_message()
-
-        if not reply or not reply.media:
-            await event.reply(
-                "Reply to an image or photo with `.sticker`."
-            )
-            return
-
-        try:
-            raw_image = await client.download_media(reply, file=bytes)
-
-            if not isinstance(raw_image, bytes):
-                await event.reply("Couldn't download the image.")
-                return
-
-            sticker = await asyncio.to_thread(
-                make_sticker_image, raw_image
-            )
-            await send_sticker(client, event.chat_id, sticker)
-
-        except Exception as exc:
-            print("Sticker command error:", type(exc).__name__)
-            await event.reply(
-                "Couldn't create the sticker. Try replying to a normal "
-                "photo or image file."
-            )
-        return
-
-    # ---------------- QUOTE STICKER ----------------
-    if command == ".quote":
-        reply = await event.get_reply_message()
-
-        if not reply or not (reply.raw_text or "").strip():
-            await event.reply(
-                "Reply to a text message with `.quote` to make a quote sticker."
-            )
-            return
-
-        try:
-            sender = await reply.get_sender()
-            if not sender:
-                await event.reply("Couldn't identify the message sender.")
-                return
-
-            first = getattr(sender, "first_name", None) or ""
-            last = getattr(sender, "last_name", None) or ""
-            name = f"{first} {last}".strip() or getattr(
-                sender, "title", "Unknown user"
-            )
-
-            photo = await get_profile_photo_bytes(client, sender)
-            quote_sticker = await asyncio.to_thread(
-                make_quote_sticker,
-                name,
-                reply.raw_text.strip(),
-                photo,
-            )
-            await send_sticker(client, event.chat_id, quote_sticker)
-
-        except Exception as exc:
-            print("Quote command error:", type(exc).__name__)
-            await event.reply("Couldn't create the quote sticker.")
-        return
-
-    # ---------------- BLOCK / UNBLOCK ----------------
-    if command in (".block", ".unblock"):
-        reply = await event.get_reply_message()
-
-        if not reply:
-            await event.reply(f"Reply to a user's message with `{command}`.")
-            return
-
-        try:
-            target = await reply.get_sender()
-            if command == ".block":
-                await client.block_user(target)
-                await event.reply("User blocked.")
-            else:
-                await client.unblock_user(target)
-                await event.reply("User unblocked.")
-        except Exception as exc:
-            print("Block command error:", type(exc).__name__)
-            await event.reply("Couldn't complete that action.")
-        return
-
-    # ---------------- COPY ----------------
-    if command == ".copy":
-        reply = await event.get_reply_message()
-        if not reply or not reply.raw_text:
-            await event.reply("Reply to a text message with `.copy`.")
-            return
-        await client.send_message(event.chat_id, reply.raw_text)
-        return
-
-    # ---------------- TRANSLATE ----------------
-    if command == ".translate":
-        args = argument.split(maxsplit=1)
-
-        if len(args) != 2:
-            await event.reply(
-                "Usage: `.translate es Hello there`\n"
-                "You can also use `.translate hindi Hello there`."
-            )
-            return
-
-        language, source_text = args
-
-        try:
-            result = await translate_text(language, source_text)
-            if not result:
-                await event.reply("No translation was returned.")
-            else:
-                await event.reply(result)
-        except Exception as exc:
-            # Don't print private message content.
-            print("Translation error:", type(exc).__name__)
-            await event.reply(
-                "Translation failed. Check the language name/code and "
-                "try again. Example: `.translate hi Hello`."
-            )
-        return
-
-    # ---------------- PURGE ----------------
-    if command in (".purge", ".cleanall"):
-        if command == ".cleanall":
-            count = 100
-        else:
-            try:
-                count = int(argument)
-            except ValueError:
-                await event.reply("Usage: `.purge 10`")
-                return
-
-        if count < 1 or count > 100:
-            await event.reply("Choose a number between 1 and 100.")
-            return
-
-        try:
-            async for message in client.iter_messages(
-                event.chat_id, limit=count + 1
-            ):
-                if message.out:
-                    await message.delete()
-        except Exception as exc:
-            print("Purge error:", type(exc).__name__)
-        return
-
-    # ---------------- LIMITED SPAM ----------------
-    if command == ".spam":
-        args = argument.split(maxsplit=1)
-
-        if len(args) != 2:
-            await event.reply("Usage: `.spam 3 Hello`")
-            return
-
-        try:
-            count = int(args[0])
-        except ValueError:
-            await event.reply("Enter a valid count.")
-            return
-
-        if not 1 <= count <= 5:
-            await event.reply("Count must be between 1 and 5.")
-            return
-
-        for _ in range(count):
-            await client.send_message(event.chat_id, args[1])
-            await asyncio.sleep(1)
-        return
-
-
-# =========================================================
-# CONNECT USER ACCOUNT
-# =========================================================
-
-async def connect_user(session):
+async def connect_user(session_string):
     global user_client
+    if not session_string or not session_string.strip():
+        raise ValueError("Empty session string")
+    client = TelegramClient(StringSession(session_string.strip()), API_ID, TG_API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise ValueError("Session is not authorized. Generate a valid Telethon StringSession.")
 
-    candidate = TelegramClient(
-        StringSession(session.strip()),
-        API_ID,
-        API_HASH,
-    )
+    @client.on(events.NewMessage(outgoing=True))
+    async def command_handler(event):
+        raw = (event.raw_text or "").strip()
+        if not raw.startswith("."):
+            return
+        parts = raw[1:].split(maxsplit=1)
+        command = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+        try:
+            if command == "help":
+                await event.reply("**Userbot commands**\n.help .ping .id .info .cal .autocal\n.todo .todos .done .remind .reminders\n.afk .back .pfp .sticker .quote\n.block .unblock .copy .translate .purge .cleanall .spam")
+            elif command == "ping":
+                start = time.monotonic(); msg = await event.reply("Pong!")
+                await msg.edit(f"Pong! `{(time.monotonic()-start)*1000:.0f} ms`")
+            elif command == "id":
+                chat = await event.get_chat(); reply = await event.get_reply_message()
+                target = await reply.get_sender() if reply else chat
+                await event.reply(f"Chat ID: `{event.chat_id}`\nUser ID: `{getattr(target, 'id', 'unknown')}`")
+            elif command == "info":
+                reply = await event.get_reply_message()
+                entity = await reply.get_sender() if reply else await event.get_chat()
+                first = getattr(entity, "first_name", "") or ""
+                last = getattr(entity, "last_name", "") or ""
+                username = getattr(entity, "username", None)
+                await event.reply(f"**Name:** {first} {last}\n**ID:** `{entity.id}`\n**Username:** @{username if username else 'none'}\n**Profile:** tg://user?id={entity.id}")
+            elif command == "cal":
+                if not arg: await event.reply("Usage: `.cal 12*(3+4)`"); return
+                await event.reply(f"`{arg} = {safe_calculate(arg)}`")
+            elif command == "autocal":
+                reply = await event.get_reply_message()
+                expression = arg or (reply.raw_text if reply else "")
+                if not expression: await event.reply("Usage: `.autocal 2+2` or reply to a calculation"); return
+                try: result = safe_calculate(expression)
+                except Exception: return
+                await event.reply(f"`{expression} = {result}`")
+            elif command == "todo":
+                if not arg: await event.reply("Usage: `.todo buy milk`"); return
+                with db() as conn:
+                    cur = conn.execute("INSERT INTO todos(owner,task,created) VALUES(?,?,?)", (OWNER_ID_INT, arg, time.time()))
+                    item_id = cur.lastrowid
+                await event.reply(f"Added todo #{item_id}: {arg}")
+            elif command == "todos":
+                with db() as conn: rows = conn.execute("SELECT id,task,done FROM todos WHERE owner=? ORDER BY id DESC LIMIT 30", (OWNER_ID_INT,)).fetchall()
+                await event.reply("**Todos**\n" + ("\n".join(f"{'✅' if r['done'] else '⬜'} #{r['id']} — {r['task']}" for r in rows) if rows else "No todos yet."))
+            elif command == "done":
+                try: item_id = int(arg.strip().lstrip("#"))
+                except ValueError: await event.reply("Usage: `.done 3`"); return
+                with db() as conn: cur = conn.execute("UPDATE todos SET done=1 WHERE id=? AND owner=?", (item_id, OWNER_ID_INT))
+                await event.reply("Marked done." if cur.rowcount else "Todo not found.")
+            elif command == "remind":
+                match = re.match(r"^(\S+)\s+(.+)$", arg)
+                if not match: await event.reply("Usage: `.remind 10m take a break`"); return
+                seconds = parse_duration(match.group(1)); text = match.group(2)
+                with db() as conn: cur = conn.execute("INSERT INTO reminders(owner,text,due) VALUES(?,?,?)", (OWNER_ID_INT, text, time.time()+seconds))
+                await event.reply(f"Reminder #{cur.lastrowid} set for {match.group(1)} from now.")
+            elif command == "reminders":
+                with db() as conn: rows = conn.execute("SELECT id,text,due FROM reminders WHERE owner=? AND sent=0 ORDER BY due LIMIT 30", (OWNER_ID_INT,)).fetchall()
+                await event.reply("**Reminders**\n" + ("\n".join(f"#{r['id']} — {r['text']} ({datetime.fromtimestamp(r['due']).strftime('%d %b %H:%M')})" for r in rows) if rows else "No pending reminders."))
+            elif command == "afk":
+                afk_state[OWNER_ID_INT] = arg or "AFK"
+                await event.reply("AFK enabled. Use `.back` to disable.")
+            elif command == "back":
+                afk_state.pop(OWNER_ID_INT, None); await event.reply("Welcome back! AFK disabled.")
+            elif command == "pfp":
+                reply = await event.get_reply_message()
+                entity = await reply.get_sender() if reply else await event.get_chat()
+                photo = await event.client.download_profile_photo(entity, file=bytes)
+                if not photo: await event.reply("No profile photo found."); return
+                # Send as a regular Telegram photo/image, not as a document.
+                await event.client.send_file(event.chat_id, io.BytesIO(photo), file_name="profile.jpg", force_document=False, reply_to=event.id)
+            elif command == "sticker":
+                image_bytes = await get_reply_image_bytes(event)
+                if not image_bytes: await event.reply("Reply to a photo/image with `.sticker`."); return
+                sticker = make_sticker_image(image_bytes)
+                await send_sticker(event.client, event.chat_id, sticker, alt="🙂", reply_to=event.id)
+            elif command == "quote":
+                reply = await event.get_reply_message()
+                if not reply or not (reply.raw_text or "").strip(): await event.reply("Reply to a text message with `.quote`."); return
+                sender = await reply.get_sender()
+                name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or "Telegram user"
+                avatar = await event.client.download_profile_photo(sender, file=bytes)
+                sticker = make_quote_sticker(reply.raw_text.strip(), name, avatar)
+                await send_sticker(event.client, event.chat_id, sticker, alt="💬", reply_to=event.id)
+            elif command == "block":
+                reply = await event.get_reply_message()
+                target = arg or (str((await reply.get_sender()).id) if reply else "")
+                if not target: await event.reply("Reply to a user or provide their ID/username."); return
+                entity = await event.client.get_entity(target)
+                await event.client(functions.contacts.BlockRequest(entity)); await event.reply("User blocked.")
+            elif command == "unblock":
+                if not arg: await event.reply("Usage: `.unblock @username` or user ID"); return
+                entity = await event.client.get_entity(arg)
+                await event.client(functions.contacts.UnblockRequest(entity)); await event.reply("User unblocked.")
+            elif command == "copy":
+                reply = await event.get_reply_message()
+                if not reply: await event.reply("Reply to a message with `.copy`."); return
+                if reply.raw_text: await event.reply(reply.raw_text)
+                elif reply.media:
+                    media = await event.client.download_media(reply, file=bytes)
+                    if media: await event.client.send_file(event.chat_id, media, caption=reply.message or "", reply_to=event.id)
+                    else: await event.reply("Could not copy that media.")
+                else: await event.reply("That message has no copyable text or media.")
+            elif command == "translate":
+                match = re.match(r"^(\S+)\s+(.+)$", arg, flags=re.S)
+                reply = await event.get_reply_message()
+                if match:
+                    language, source_text = match.group(1), match.group(2).strip()
+                elif reply and reply.raw_text:
+                    language, source_text = (arg.strip() or "en"), reply.raw_text.strip()
+                else:
+                    await event.reply("Usage: `.translate hi How are you` or reply to text with `.translate hi`"); return
+                try:
+                    result = await translate_text(language, source_text)
+                    await event.reply(f"**Translation ({language})**\n{result}")
+                except Exception as exc:
+                    log.exception("Translation command failed")
+                    await event.reply(f"Translation failed ({type(exc).__name__}). Try a language name/code like `hi`, `en`, `fr`, or check Render logs.")
+            elif command == "purge":
+                try: count = max(1, min(100, int(arg or "10")))
+                except ValueError: count = 10
+                messages = await event.client.get_messages(event.chat_id, limit=count+1, min_id=event.id)
+                ids = [m.id for m in messages if m.id != event.id]
+                if ids: await event.client.delete_messages(event.chat_id, ids)
+                await event.delete()
+            elif command == "cleanall":
+                # Delete recent outgoing messages only; this is intentionally bounded.
+                try: count = max(1, min(100, int(arg or "30")))
+                except ValueError: count = 30
+                messages = await event.client.get_messages(event.chat_id, limit=count)
+                ids = [m.id for m in messages if m.out]
+                if ids: await event.client.delete_messages(event.chat_id, ids)
+            elif command == "spam":
+                match = re.match(r"^(\d+)\s+(.+)$", arg, flags=re.S)
+                if not match: await event.reply("Usage: `.spam 3 hello` (max 10)"); return
+                count = max(1, min(10, int(match.group(1))))
+                text = match.group(2)
+                await event.delete()
+                for _ in range(count): await event.client.send_message(event.chat_id, text)
+        except Exception as exc:
+            log.exception("Command .%s failed", command)
+            try: await event.reply(f"Command failed: {type(exc).__name__}")
+            except Exception: pass
 
-    try:
-        await candidate.connect()
+    @client.on(events.NewMessage(incoming=True))
+    async def afk_handler(event):
+        if not afk_state or not event.is_private and not event.mentioned:
+            return
+        sender = await event.get_sender()
+        if getattr(sender, "bot", False) or getattr(sender, "id", None) == OWNER_ID_INT:
+            return
+        reason = afk_state.get(OWNER_ID_INT)
+        if reason:
+            try: await event.reply(f"I'm currently AFK: {reason}")
+            except Exception: pass
 
-        if not await candidate.is_user_authorized():
-            await candidate.disconnect()
-            return False, "Session is invalid or unauthorized."
-
-        me = await candidate.get_me()
-        if not me:
-            await candidate.disconnect()
-            return False, "Could not identify the account."
-
-        @candidate.on(events.NewMessage(outgoing=True))
-        async def outgoing_commands(event):
-            try:
-                await handle_user_commands(candidate, event)
-            except Exception as exc:
-                print("Command handler error:", type(exc).__name__)
-
-        @candidate.on(events.NewMessage(incoming=True))
-        async def incoming_afk(event):
-            if not afk_reason or event.out or not event.is_private:
-                return
-            if event.sender_id == OWNER_ID:
-                return
-
-            try:
-                await event.reply(f"I'm AFK: {afk_reason}")
-            except Exception as exc:
-                print("AFK handler error:", type(exc).__name__)
-
-        old = user_client
-        user_client = candidate
-
-        if old and old.is_connected():
-            await old.disconnect()
-
-        return True, f"Connected as {me.first_name}."
-
-    except Exception as exc:
-        if candidate.is_connected():
-            await candidate.disconnect()
-        print("User connection error:", type(exc).__name__)
-        return False, "Could not connect. Check the Render logs."
-
-
-# =========================================================
-# MANAGEMENT BOT COMMANDS
-# =========================================================
-
-def is_owner(update):
-    return (
-        update.effective_user is not None
-        and update.effective_user.id == OWNER_ID
-    )
+    if user_client and user_client.is_connected():
+        await user_client.disconnect()
+    user_client = client
+    return client
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if update.effective_user and update.effective_user.id != OWNER_ID_INT:
+        await update.message.reply_text("This management bot is private.")
         return
-
-    await update.effective_message.reply_text(
-        "Telegram manager is online.\n\n"
-        "/login — connect your Telegram account\n"
-        "/status — connection status\n"
-        "/help — command list"
+    await update.message.reply_text(
+        "Userbot manager ready.\n\n"
+        "/login - connect your Telethon StringSession\n"
+        "/status - show connection status\n"
+        "/cancel - cancel login\n"
+        "/help - show commands"
     )
-
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if update.effective_user and update.effective_user.id != OWNER_ID_INT:
         return
-
-    await update.effective_message.reply_text(
-        "/login — connect with a Telethon StringSession\n"
-        "/cancel — cancel login\n"
-        "/status — check connection\n\n"
-        "After login, send `.help` from your own Telegram account "
-        "to see userbot commands."
+    await update.message.reply_text(
+        "Management commands:\n/login, /status, /cancel, /help\n\n"
+        "Send your Telethon StringSession after starting /login. Never share it with anyone."
     )
-
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not update.effective_user or update.effective_user.id != OWNER_ID_INT:
+        await update.message.reply_text("Not authorized.")
         return
-
-    if update.effective_chat.type != "private":
-        await update.effective_message.reply_text(
-            "Use /login in a private chat."
-        )
-        return
-
-    login_waiting.add(OWNER_ID)
-    await update.effective_message.reply_text(
+    login_sessions[update.effective_user.id] = True
+    context.user_data["awaiting_session"] = True
+    await update.message.reply_text(
         "Send your Telethon StringSession in your next message.\n"
-        "Keep it secret: it can grant access to your account.\n"
-        "Use /cancel to cancel."
+        "Treat it like a password: anyone with it can access your Telegram account.\n"
+        "Use /cancel to stop."
     )
-
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if update.effective_user:
+        login_sessions.pop(update.effective_user.id, None)
+    context.user_data.pop("awaiting_session", None)
+    await update.message.reply_text("Cancelled.")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != OWNER_ID_INT:
+        await update.message.reply_text("Not authorized.")
         return
+    connected = bool(user_client and user_client.is_connected() and await user_client.is_user_authorized())
+    await update.message.reply_text("User account: connected ✅" if connected else "User account: disconnected ❌")
 
-    login_waiting.discard(OWNER_ID)
-    await update.effective_message.reply_text("Login cancelled.")
-
-
-async def receive_session(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_owner(update):
+async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != OWNER_ID_INT:
         return
-    if OWNER_ID not in login_waiting:
+    if not context.user_data.get("awaiting_session"):
         return
-    if update.effective_chat.type != "private":
+    session_string = (update.message.text or "").strip()
+    if not session_string:
+        await update.message.reply_text("Please send a valid StringSession, or /cancel.")
         return
-
-    session = (update.effective_message.text or "").strip()
-    if not session or session.startswith("/"):
-        return
-
-    login_waiting.discard(OWNER_ID)
-
+    # Remove the message containing the session from the management chat when possible.
     try:
-        await update.effective_message.delete()
+        await update.message.delete()
     except Exception:
         pass
+    context.user_data.pop("awaiting_session", None)
+    login_sessions.pop(update.effective_user.id, None)
+    status_msg = await update.message.reply_text("Connecting user account...")
+    try:
+        await connect_user(session_string)
+        # Do not store the session in logs or send it back to chat.
+        await status_msg.edit_text("Connected successfully. Your userbot is ready.")
+    except Exception as exc:
+        log.exception("User session connection failed")
+        await status_msg.edit_text(f"Login failed: {type(exc).__name__}. Check API ID/hash and StringSession, then try /login again.")
 
-    status = await context.bot.send_message(
-        chat_id=OWNER_ID,
-        text="Connecting your Telegram account...",
-    )
-
-    success, message = await connect_user(session)
-    await status.edit_text(message)
-
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_owner(update):
-        return
-
-    if user_client and user_client.is_connected():
+async def reminder_worker(application: Application):
+    while True:
         try:
-            me = await user_client.get_me()
-            await update.effective_message.reply_text(
-                f"Userbot connected as {me.first_name}."
-            )
+            now = time.time()
+            with db() as conn:
+                rows = conn.execute("SELECT id,owner,text FROM reminders WHERE sent=0 AND due<=?", (now,)).fetchall()
+                if rows:
+                    conn.executemany("UPDATE reminders SET sent=1 WHERE id=?", [(r["id"],) for r in rows])
+            for row in rows:
+                try:
+                    await application.bot.send_message(chat_id=row["owner"], text=f"⏰ Reminder: {row['text']}")
+                except Exception:
+                    log.exception("Could not send reminder %s", row["id"])
         except Exception:
-            await update.effective_message.reply_text(
-                "Connected, but account details could not be retrieved."
-            )
-    else:
-        await update.effective_message.reply_text("Userbot disconnected.")
+            log.exception("Reminder worker error")
+        await asyncio.sleep(5)
 
+async def post_init(application: Application):
+    application.create_task(reminder_worker(application))
 
-async def error_handler(update, context):
-    print("Management bot error:", type(context.error).__name__)
-
-
-def run_bot():
-    application = Application.builder().token(BOT_TOKEN).build()
-
+async def run_bot():
+    if not BOT_TOKEN or not API_ID or not TG_API_HASH or not OWNER_ID_INT:
+        raise RuntimeError("Missing required environment variables: BOT_TOKEN, TG_API_ID, TG_API_HASH, OWNER_ID")
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, session_message))
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    # Keep the bot process alive. Render's health endpoint is served separately in a thread.
+    while True:
+        await asyncio.sleep(3600)
 
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_session)
-    )
-
-    application.add_error_handler(error_handler)
-    application.run_polling(drop_pending_updates=True)
-
-
-# =========================================================
-# START
-# =========================================================
-
-def main():
-    threading.Thread(target=run_web, daemon=True).start()
-    run_bot()
-
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    main()
+    import threading
+    threading.Thread(target=run_flask, daemon=True).start()
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        log.info("Shutting down")
