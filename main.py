@@ -65,6 +65,19 @@ def run_web():
 async def connect_user(session):
     global user_client
 
+    
+        @candidate.on(events.NewMessage(incoming=True))
+        async def afk_replies(event):
+            if not afk_reason or event.is_private is False:
+                return
+            if event.sender_id == OWNER_ID:
+                return
+            try:
+                await event.reply(f"I'm currently AFK: {afk_reason}")
+            except Exception:
+                pass
+
+
     candidate = None
 
     try:
