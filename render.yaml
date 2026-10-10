@@ -1,17 +1,16 @@
-
 services:
-  - type: worker
-    name: telegram-account-manager
+  - type: web
+    name: telegram-userbot
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python manager_bot.py
+    startCommand: python app.py
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: DATA_DIR
-        value: /var/data
-    disk:
-      name: manager-data
-      mountPath: /var/data
-      sizeGB: 1
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_STRING_SESSION
+        sync: false
