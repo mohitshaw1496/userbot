@@ -120,28 +120,64 @@ def parse_duration(value):
     return seconds
 
 
+
 async def connect_user(session):
     global user_client
 
-    candidate = None
+    candidate = TelegramClient(
+        StringSession(session.strip()),
+        API_ID,
+        API_HASH
+    )
+
     try:
-        candidate = TelegramClient(
-            StringSession(session.strip()), API_ID, API_HASH
-        )
         await candidate.connect()
 
         if not await candidate.is_user_authorized():
             await candidate.disconnect()
-            return False, "Session is not authorized. Generate a valid Telethon StringSession."
+            return False, "Session is invalid or unauthorized."
 
-        
-me = await candidate.get_me()
-if not me:
-    await candidate.disconnect()
-    return False, "Could not identify the account."
+        me = await candidate.get_me()
 
-# Register commands on the logged-in user account.
-@candidate.on(events.NewMessage(outgoing=True))
+        if not me:
+            await candidate.disconnect()
+            return False, "Could not identify the account."
+
+        # Register outgoing user commands.
+        @candidate.on(events.NewMessage(outgoing=True))
+        async def outgoing_commands(event):
+            try:
+                await handle_user_commands(candidate, event)
+            except Exception as exc:
+                print("Command handler error:", type(exc).__name__)
+
+        # Reply to private messages while AFK.
+        @candidate.on(events.NewMessage(incoming=True))
+        async def incoming_afk(event):
+            if not afk_reason or event.out or not event.is_private:
+                return
+            if event.sender_id == OWNER_ID:
+                return
+
+            try:
+                await event.reply(f"I'm AFK: {afk_reason}")
+            except Exception as exc:
+                print("AFK handler error:", type(exc).__name__)
+
+        old = user_client
+        user_client = candidate
+
+        if old and old.is_connected():
+            await old.disconnect()
+
+        return True, f"Connected as {me.first_name}."
+
+    except Exception as exc:
+        if candidate.is_connected():
+            await candidate.disconnect()
+        print("User connection error:", type(exc).__name__)
+        return False, "Could not connect. Check the Render logs."
+
 async def outgoing_commands(event):
     try:
         await handle_user_commands(candidate, event)
