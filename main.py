@@ -95,17 +95,19 @@ LANGUAGE_CODES = {
 }
 
 async def translate_text(target, source_text):
-    """Translate text with multiple fallbacks and useful provider diagnostics."""
+    """Translate with several independent backends and log safe diagnostics."""
     requested = (target or "").lower().strip()
     target = LANGUAGE_ALIASES.get(requested, requested)
     target_code = LANGUAGE_CODES.get(target, requested)
     source_text = (source_text or "").strip()
     if not source_text:
         raise ValueError("No text was provided to translate.")
+    if not re.fullmatch(r"[a-zA-Z-]{2,12}", target_code):
+        raise ValueError("Please use a supported language name or ISO code.")
 
     errors = []
 
-    # Provider 1: deep-translator's Google backend, trying name and ISO code.
+    # Provider 1: deep-translator's Google backend.
     for google_target in dict.fromkeys((target, target_code)):
         try:
             result = await asyncio.to_thread(
@@ -113,11 +115,11 @@ async def translate_text(target, source_text):
             )
             if result and result.strip():
                 return result.strip()
-            errors.append("GoogleTranslator returned an empty result")
+            errors.append(f"GoogleTranslator/{google_target}: empty result")
         except Exception as exc:
             errors.append(f"GoogleTranslator/{google_target}: {type(exc).__name__}")
 
-    # Provider 2: Google's lightweight endpoint with automatic source detection.
+    # Provider 2: Google Translate's lightweight endpoint.
     try:
         params = urllib.parse.urlencode({
             "client": "gtx", "sl": "auto", "tl": target_code, "dt": "t", "q": source_text
@@ -126,17 +128,41 @@ async def translate_text(target, source_text):
             "https://translate.googleapis.com/translate_a/single?" + params,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(request, timeout=18) as response:
+        with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read().decode("utf-8"))
         translated = "".join(part[0] for part in (payload[0] or []) if part and part[0])
         if translated.strip():
             return translated.strip()
-        errors.append("Google endpoint returned an empty result")
+        errors.append("Google endpoint: empty result")
     except Exception as exc:
         errors.append(f"Google endpoint: {type(exc).__name__}")
 
-    # Provider 3: MyMemory fallback. The service may reject autodetect, so try it
-    # first and then English as a last resort for English source text.
+    # Provider 3: public LibreTranslate instances. They may be unavailable,
+    # so try more than one and continue on HTTP/network/API errors.
+    for endpoint in (
+        "https://translate.terraprint.co/translate",
+        "https://translate.fedilab.app/translate",
+        "https://libretranslate.de/translate",
+    ):
+        try:
+            body = json.dumps({
+                "q": source_text, "source": "auto", "target": target_code, "format": "text"
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                endpoint, data=body, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(request, timeout=12) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            result = data.get("translatedText") if isinstance(data, dict) else None
+            if result and str(result).strip():
+                return str(result).strip()
+            errors.append(f"LibreTranslate {urllib.parse.urlparse(endpoint).netloc}: empty result")
+        except Exception as exc:
+            errors.append(f"LibreTranslate {urllib.parse.urlparse(endpoint).netloc}: {type(exc).__name__}")
+
+    # Provider 4: MyMemory. Auto-detect is attempted first; English is a final
+    # fallback for messages that are actually written in English.
     for source_code in ("autodetect", "en"):
         try:
             params = urllib.parse.urlencode({
@@ -146,16 +172,17 @@ async def translate_text(target, source_text):
                 "https://api.mymemory.translated.net/get?" + params,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=12) as response:
                 data = json.loads(response.read().decode("utf-8"))
             result = data.get("responseData", {}).get("translatedText")
             status = data.get("responseStatus")
-            if result and str(status or 200) == "200" and result.strip():
-                return result.strip()
-            errors.append(f"MyMemory ({source_code}): API status {status}; no usable translation")
+            if result and str(status or 200) == "200" and str(result).strip():
+                return str(result).strip()
+            errors.append(f"MyMemory/{source_code}: API status {status}; empty/failed result")
         except Exception as exc:
             errors.append(f"MyMemory/{source_code}: {type(exc).__name__}")
 
+    # Log provider names and exception types only, never the source text.
     log.error("All translation providers failed: %s", " | ".join(errors))
     raise RuntimeError("All translation providers failed; check Render logs for provider details.")
 
@@ -417,7 +444,15 @@ async def connect_user(session_string):
                     avatar = None
                 sticker = make_quote_sticker(reply.raw_text.strip(), name, avatar)
                 # Reply to the original message being quoted, not to the .quote command itself.
-                await send_sticker(event.client, event.chat_id, sticker, alt="💬", reply_to=reply.id)
+                try:
+                    await send_sticker(event.client, event.chat_id, sticker, alt="💬", reply_to=reply.id)
+                except Exception:
+                    log.exception("Telegram rejected the .quote sticker upload; sending the generated WebP as a fallback")
+                    sticker.seek(0)
+                    await event.client.send_file(
+                        event.chat_id, sticker, file_name="quote.webp", mime_type="image/webp",
+                        force_document=True, reply_to=reply.id,
+                    )
             elif command == "block":
                 reply = await event.get_reply_message()
                 target = arg or (str((await reply.get_sender()).id) if reply else "")
@@ -452,7 +487,10 @@ async def connect_user(session_string):
                     await event.reply(f"**Translation ({language})**\n{result}", reply_to=reply.id)
                 except Exception as exc:
                     log.exception("Translation command failed")
-                    await event.reply(f"Translation failed ({type(exc).__name__}). Try a language name/code like `hindi`, `hi`, `english`, or `fr`, or check Render logs.")
+                    await event.reply(
+                        f"Translation failed ({type(exc).__name__}). I tried several providers. "
+                        "Check Render logs for provider-specific error types; retry later if network access is blocked."
+                    )
             elif command == "purge":
                 try: count = max(1, min(100, int(arg or "10")))
                 except ValueError: count = 10
