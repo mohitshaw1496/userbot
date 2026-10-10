@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 
 from flask import Flask
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from deep_translator import GoogleTranslator
 from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -84,22 +83,32 @@ LANGUAGE_ALIASES = {
     "kn": "kannada", "or": "odia", "as": "assamese"
 }
 
-# MyMemory expects ISO language codes, while GoogleTranslator accepts language names.
+# LibreTranslate expects ISO language codes, not language names.
 LANGUAGE_CODES = {
     "english": "en", "hindi": "hi", "bengali": "bn", "tamil": "ta", "telugu": "te",
     "marathi": "mr", "gujarati": "gu", "punjabi": "pa", "urdu": "ur", "spanish": "es",
     "french": "fr", "german": "de", "italian": "it", "portuguese": "pt", "russian": "ru",
     "japanese": "ja", "korean": "ko", "chinese": "zh", "arabic": "ar", "indonesian": "id",
     "turkish": "tr", "vietnamese": "vi", "thai": "th", "nepali": "ne", "malayalam": "ml",
-    "kannada": "kn", "odia": "or", "assamese": "as"
+    "kannada": "kn", "odia": "or", "assamese": "as",
 }
 
-# Avoid repeatedly hitting public services when all providers are failing.
+# LibreTranslate API settings. Set LIBRETRANSLATE_URL to your preferred instance.
+# Self-hosted instances normally do not need an API key; managed instances may.
+LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "").strip().rstrip("/")
+LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "").strip()
+
+# Public instances can change availability or rate limits; use a custom URL first if configured.
+_DEFAULT_LIBRETRANSLATE_INSTANCES = (
+    "https://translate.terraprint.co",
+    "https://translate.fedilab.app",
+    "https://libretranslate.de",
+)
 _TRANSLATION_COOLDOWN_UNTIL = 0.0
 _TRANSLATION_COOLDOWN_SECONDS = 45
 
 async def translate_text(target, source_text):
-    """Translate using free public backends, with rate-limit protection."""
+    """Translate text through the LibreTranslate API (no Google/MyMemory fallback)."""
     global _TRANSLATION_COOLDOWN_UNTIL
     requested = (target or "").lower().strip()
     target = LANGUAGE_ALIASES.get(requested, requested)
@@ -113,112 +122,52 @@ async def translate_text(target, source_text):
         raise ValueError("Please translate text shorter than 4,500 characters.")
     if time.time() < _TRANSLATION_COOLDOWN_UNTIL:
         remaining = max(1, int(_TRANSLATION_COOLDOWN_UNTIL - time.time()))
-        raise RuntimeError(f"Free translation providers are cooling down. Try again in about {remaining} seconds.")
+        raise RuntimeError(f"LibreTranslate is cooling down. Try again in about {remaining} seconds.")
 
+    instances = []
+    if LIBRETRANSLATE_URL:
+        instances.append(LIBRETRANSLATE_URL)
+    instances.extend(url for url in _DEFAULT_LIBRETRANSLATE_INSTANCES if url != LIBRETRANSLATE_URL)
     errors = []
-    google_rate_limited = False
 
-    # Try Google only once: retrying with a second spelling can worsen 429 limits.
-    try:
-        result = await asyncio.to_thread(
-            lambda: GoogleTranslator(source="auto", target=target_code).translate(source_text)
-        )
-        if result and result.strip():
-            _TRANSLATION_COOLDOWN_UNTIL = 0.0
-            return result.strip()
-        errors.append("GoogleTranslator: empty result")
-    except Exception as exc:
-        error_name = type(exc).__name__
-        errors.append(f"GoogleTranslator: {error_name}")
-        google_rate_limited = "TooManyRequests" in error_name or "429" in str(exc)
-
-    # Lingva is a free frontend; availability and supported languages vary by instance.
-    encoded_text = urllib.parse.quote(source_text, safe="")
-    for host in ("lingva.ml", "lingva.lunar.icu"):
+    for base_url in instances:
+        endpoint = base_url if base_url.endswith("/translate") else f"{base_url}/translate"
         try:
-            url = f"https://{host}/api/v1/auto/{urllib.parse.quote(target_code, safe='')}/{encoded_text}"
-            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=12) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            result = data.get("translation") if isinstance(data, dict) else None
-            if result and str(result).strip():
-                _TRANSLATION_COOLDOWN_UNTIL = 0.0
-                return str(result).strip()
-            errors.append(f"Lingva {host}: empty result")
-        except Exception as exc:
-            errors.append(f"Lingva {host}: {type(exc).__name__}")
-
-    # Google lightweight endpoint is skipped after a Google rate limit.
-    if not google_rate_limited:
-        try:
-            params = urllib.parse.urlencode({
-                "client": "gtx", "sl": "auto", "tl": target_code, "dt": "t", "q": source_text
-            })
+            payload = {
+                "q": source_text,
+                "source": "auto",
+                "target": target_code,
+                "format": "text",
+            }
+            if LIBRETRANSLATE_API_KEY:
+                payload["api_key"] = LIBRETRANSLATE_API_KEY
+            body = json.dumps(payload).encode("utf-8")
             request = urllib.request.Request(
-                "https://translate.googleapis.com/translate_a/single?" + params,
-                headers={"User-Agent": "Mozilla/5.0"},
+                endpoint,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "TelegramUserbot/1.0"},
             )
-            with urllib.request.urlopen(request, timeout=12) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            translated = "".join(part[0] for part in (payload[0] or []) if part and part[0])
-            if translated.strip():
-                _TRANSLATION_COOLDOWN_UNTIL = 0.0
-                return translated.strip()
-            errors.append("Google endpoint: empty result")
-        except Exception as exc:
-            errors.append(f"Google endpoint: {type(exc).__name__}")
-    else:
-        errors.append("Google endpoint: skipped after rate limit")
-
-    # Public LibreTranslate servers may be unavailable or require a key.
-    for endpoint in (
-        "https://translate.terraprint.co/translate",
-        "https://translate.fedilab.app/translate",
-        "https://libretranslate.de/translate",
-    ):
-        try:
-            body = json.dumps({
-                "q": source_text, "source": "auto", "target": target_code, "format": "text"
-            }).encode("utf-8")
-            request = urllib.request.Request(
-                endpoint, data=body, method="POST",
-                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=15) as response:
                 data = json.loads(response.read().decode("utf-8"))
             result = data.get("translatedText") if isinstance(data, dict) else None
             if result and str(result).strip():
                 _TRANSLATION_COOLDOWN_UNTIL = 0.0
                 return str(result).strip()
-            errors.append(f"LibreTranslate {urllib.parse.urlparse(endpoint).netloc}: empty result")
+            api_error = data.get("error", "empty translatedText") if isinstance(data, dict) else "invalid response"
+            errors.append(f"{urllib.parse.urlparse(endpoint).netloc}: {api_error}")
         except Exception as exc:
-            errors.append(f"LibreTranslate {urllib.parse.urlparse(endpoint).netloc}: {type(exc).__name__}")
-
-    # MyMemory free endpoint, with autodetect then English source fallback.
-    for source_code in ("autodetect", "en"):
-        try:
-            params = urllib.parse.urlencode({
-                "q": source_text, "langpair": f"{source_code}|{target_code}"
-            })
-            request = urllib.request.Request(
-                "https://api.mymemory.translated.net/get?" + params,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            result = data.get("responseData", {}).get("translatedText")
-            status = data.get("responseStatus")
-            if result and str(status or 200) == "200" and str(result).strip():
-                _TRANSLATION_COOLDOWN_UNTIL = 0.0
-                return str(result).strip()
-            errors.append(f"MyMemory/{source_code}: API status {status}; empty/failed result")
-        except Exception as exc:
-            errors.append(f"MyMemory/{source_code}: {type(exc).__name__}")
+            # Keep logs free of source text and credentials.
+            errors.append(f"{urllib.parse.urlparse(endpoint).netloc}: {type(exc).__name__}")
 
     _TRANSLATION_COOLDOWN_UNTIL = time.time() + _TRANSLATION_COOLDOWN_SECONDS
-    # Provider names and exception types only; never log source text.
-    log.error("All translation providers failed: %s", " | ".join(errors))
-    raise RuntimeError("Free translation services are unavailable right now. Please wait about 45 seconds and try again.")
+    log.error("All LibreTranslate instances failed: %s", " | ".join(errors))
+    if not LIBRETRANSLATE_API_KEY:
+        raise RuntimeError(
+            "LibreTranslate is unavailable or an instance requires an API key. "
+            "You can set LIBRETRANSLATE_URL to a working instance and, if required, LIBRETRANSLATE_API_KEY in Render."
+        )
+    raise RuntimeError("LibreTranslate is unavailable right now. Please wait about 45 seconds and try again.")
 
 # Calculator accepts only arithmetic syntax; no names, calls, or attributes.
 def safe_calculate(expression):
@@ -689,10 +638,11 @@ async def run_bot_once():
         await post_init(application)
         if application.updater is None:
             raise RuntimeError("Telegram bot updater is unavailable.")
-        await application.updater.start_polling(drop_pending_updates=True)
-        polling_started = True
+        # Start the update processor before polling so incoming updates are handled immediately.
         await application.start()
         application_started = True
+        await application.updater.start_polling(drop_pending_updates=True)
+        polling_started = True
         log.info("Telegram management bot started successfully.")
         # Keep this attempt alive; cancellation or an exception is handled by the retry loop.
         await asyncio.Event().wait()
@@ -724,6 +674,13 @@ async def run_bot():
     if not API_ID or not OWNER_ID_INT:
         log.error("TG_API_ID and OWNER_ID must be valid numeric values.")
 
+    log.info(
+        "Startup configuration: BOT_TOKEN=%s, TG_API_ID=%s, TG_API_HASH=%s, OWNER_ID=%s",
+        "set" if BOT_TOKEN else "MISSING",
+        "valid" if API_ID else "MISSING/INVALID",
+        "set" if TG_API_HASH else "MISSING",
+        "valid" if OWNER_ID_INT else "MISSING/INVALID",
+    )
     while True:
         if not BOT_TOKEN or not API_ID or not TG_API_HASH or not OWNER_ID_INT:
             await asyncio.sleep(60)
