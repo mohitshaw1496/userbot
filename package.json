@@ -1,0 +1,9 @@
+{
+  "name": "telegram-userbot-google-translation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Google Translate helper for a Python Telegram userbot",
+  "dependencies": {
+    "google-translate-api": "github:matheuss/google-translate-api"
+  }
+}
