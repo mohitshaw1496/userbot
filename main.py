@@ -8,8 +8,6 @@ import time
 import asyncio
 import sqlite3
 import logging
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta
 
 from flask import Flask
@@ -83,91 +81,72 @@ LANGUAGE_ALIASES = {
     "kn": "kannada", "or": "odia", "as": "assamese"
 }
 
-# LibreTranslate expects ISO language codes, not language names.
-LANGUAGE_CODES = {
-    "english": "en", "hindi": "hi", "bengali": "bn", "tamil": "ta", "telugu": "te",
-    "marathi": "mr", "gujarati": "gu", "punjabi": "pa", "urdu": "ur", "spanish": "es",
-    "french": "fr", "german": "de", "italian": "it", "portuguese": "pt", "russian": "ru",
-    "japanese": "ja", "korean": "ko", "chinese": "zh", "arabic": "ar", "indonesian": "id",
-    "turkish": "tr", "vietnamese": "vi", "thai": "th", "nepali": "ne", "malayalam": "ml",
-    "kannada": "kn", "odia": "or", "assamese": "as",
-}
-
-# LibreTranslate API settings. Set LIBRETRANSLATE_URL to your preferred instance.
-# Self-hosted instances normally do not need an API key; managed instances may.
-LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "").strip().rstrip("/")
-LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "").strip()
-
-# Public instances can change availability or rate limits; use a custom URL first if configured.
-_DEFAULT_LIBRETRANSLATE_INSTANCES = (
-    "https://translate.terraprint.co",
-    "https://translate.fedilab.app",
-    "https://libretranslate.de",
-)
+# Google Translate API helper: https://github.com/matheuss/google-translate-api
+GOOGLE_TRANSLATOR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "google_translate.cjs")
 _TRANSLATION_COOLDOWN_UNTIL = 0.0
-_TRANSLATION_COOLDOWN_SECONDS = 45
+_TRANSLATION_COOLDOWN_SECONDS = 30
 
 async def translate_text(target, source_text):
-    """Translate text through the LibreTranslate API (no Google/MyMemory fallback)."""
+    """Translate text with matheuss/google-translate-api via Node.js."""
     global _TRANSLATION_COOLDOWN_UNTIL
     requested = (target or "").lower().strip()
-    target = LANGUAGE_ALIASES.get(requested, requested)
-    target_code = LANGUAGE_CODES.get(target, requested)
+    target_language = LANGUAGE_ALIASES.get(requested, requested)
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z -]{0,39}", target_language):
+        raise ValueError("Please use a supported language name or ISO language code.")
+
+    language_names = {
+        "en": "english", "hi": "hindi", "bn": "bengali", "ta": "tamil", "te": "telugu",
+        "mr": "marathi", "gu": "gujarati", "pa": "punjabi", "ur": "urdu", "es": "spanish",
+        "fr": "french", "de": "german", "it": "italian", "pt": "portuguese", "ru": "russian",
+        "ja": "japanese", "ko": "korean", "zh": "chinese", "ar": "arabic", "id": "indonesian",
+        "tr": "turkish", "vi": "vietnamese", "th": "thai", "ne": "nepali", "ml": "malayalam",
+        "kn": "kannada", "or": "odia", "as": "assamese",
+    }
+    target_language = language_names.get(target_language, target_language)
     source_text = (source_text or "").strip()
     if not source_text:
         raise ValueError("No text was provided to translate.")
-    if not re.fullmatch(r"[a-zA-Z-]{2,12}", target_code):
-        raise ValueError("Please use a supported language name or ISO code.")
     if len(source_text) > 4500:
         raise ValueError("Please translate text shorter than 4,500 characters.")
     if time.time() < _TRANSLATION_COOLDOWN_UNTIL:
         remaining = max(1, int(_TRANSLATION_COOLDOWN_UNTIL - time.time()))
-        raise RuntimeError(f"LibreTranslate is cooling down. Try again in about {remaining} seconds.")
+        raise RuntimeError(f"Translation is cooling down. Try again in about {remaining} seconds.")
+    if not os.path.isfile(GOOGLE_TRANSLATOR_SCRIPT):
+        raise RuntimeError("google_translate.cjs is missing. Add it to the same folder as main.py.")
 
-    instances = []
-    if LIBRETRANSLATE_URL:
-        instances.append(LIBRETRANSLATE_URL)
-    instances.extend(url for url in _DEFAULT_LIBRETRANSLATE_INSTANCES if url != LIBRETRANSLATE_URL)
-    errors = []
-
-    for base_url in instances:
-        endpoint = base_url if base_url.endswith("/translate") else f"{base_url}/translate"
-        try:
-            payload = {
-                "q": source_text,
-                "source": "auto",
-                "target": target_code,
-                "format": "text",
-            }
-            if LIBRETRANSLATE_API_KEY:
-                payload["api_key"] = LIBRETRANSLATE_API_KEY
-            body = json.dumps(payload).encode("utf-8")
-            request = urllib.request.Request(
-                endpoint,
-                data=body,
-                method="POST",
-                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "TelegramUserbot/1.0"},
-            )
-            with urllib.request.urlopen(request, timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            result = data.get("translatedText") if isinstance(data, dict) else None
-            if result and str(result).strip():
-                _TRANSLATION_COOLDOWN_UNTIL = 0.0
-                return str(result).strip()
-            api_error = data.get("error", "empty translatedText") if isinstance(data, dict) else "invalid response"
-            errors.append(f"{urllib.parse.urlparse(endpoint).netloc}: {api_error}")
-        except Exception as exc:
-            # Keep logs free of source text and credentials.
-            errors.append(f"{urllib.parse.urlparse(endpoint).netloc}: {type(exc).__name__}")
-
-    _TRANSLATION_COOLDOWN_UNTIL = time.time() + _TRANSLATION_COOLDOWN_SECONDS
-    log.error("All LibreTranslate instances failed: %s", " | ".join(errors))
-    if not LIBRETRANSLATE_API_KEY:
-        raise RuntimeError(
-            "LibreTranslate is unavailable or an instance requires an API key. "
-            "You can set LIBRETRANSLATE_URL to a working instance and, if required, LIBRETRANSLATE_API_KEY in Render."
+    payload = json.dumps({"text": source_text, "target": target_language}).encode("utf-8")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "node", GOOGLE_TRANSLATOR_SCRIPT,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
         )
-    raise RuntimeError("LibreTranslate is unavailable right now. Please wait about 45 seconds and try again.")
+        stdout, stderr = await asyncio.wait_for(process.communicate(payload), timeout=45)
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            log.error("Google Translate helper failed (exit %s): %s", process.returncode, detail or "no error details")
+            raise RuntimeError("Google Translate failed. Check Node.js/dependencies or try again later.")
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+        result = data.get("translation", "") if isinstance(data, dict) else ""
+        if not isinstance(result, str) or not result.strip():
+            raise RuntimeError("Google Translate returned an empty translation. Please try again.")
+        _TRANSLATION_COOLDOWN_UNTIL = 0.0
+        return result.strip()
+    except asyncio.TimeoutError:
+        _TRANSLATION_COOLDOWN_UNTIL = time.time() + _TRANSLATION_COOLDOWN_SECONDS
+        raise RuntimeError("Translation timed out. Please try again shortly.")
+    except FileNotFoundError:
+        raise RuntimeError("Node.js is missing on Render. Add Node.js to the build environment.")
+    except json.JSONDecodeError:
+        raise RuntimeError("Google Translate returned an unreadable response. Please try again.")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        _TRANSLATION_COOLDOWN_UNTIL = time.time() + _TRANSLATION_COOLDOWN_SECONDS
+        log.error("Google Translate error: %s", type(exc).__name__)
+        raise RuntimeError("Google Translate is temporarily unavailable. Please try again shortly.")
 
 # Calculator accepts only arithmetic syntax; no names, calls, or attributes.
 def safe_calculate(expression):
